@@ -80,9 +80,14 @@ my_dataset/
 
 | Tier | Setup | Notes |
 |---|---|---|
-| 24 GB | fp8 base (`quantize: true`), 512–768px, r64–128, 8-bit AdamW | closest to the shipped recipe |
-| 32 GB+ | 1024px, higher rank affordable | full recipe |
-| 16 GB | *planned* — needs a cached-variant grounding mode (tracked in issues) | not yet supported |
+| 32 GB | fp8 base (`quantize: true`), 512px, r128 | field-tested: 27.5–31.3 GB observed in beta testing |
+| 24 GB | fp8 base, 512px, r64 | expected tight — likely needs cached text embeddings (costs grounding-jitter robustness) until the planned multi-scale grounding cache lands; reports welcome |
+| 16 GB | *planned* — needs the cached-variant grounding mode (tracked in issues) | not yet supported |
+
+Reference envelope: full-bf16 (no quantization, TE resident) peaks at **42 GB** for
+512px/r16 — measured on unified-memory hardware where nothing offloads, i.e. the
+worst-case all-on-device figure. Quantization brings the base 26→13 GB and the TE
+8→4 GB.
 
 Example configs are in `configs/`. Values in them (steps, repeats, learning rate)
 are **generic starting points** — tune for your dataset.
