@@ -32,7 +32,10 @@ in your config.
 Krea 2 RAW weights are gated: accept the license at
 [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw), then point
 `model.name_or_path` at the single-file `.safetensors` checkpoint (or a folder
-containing one — the sharded diffusers layout is not supported).
+containing one — the sharded diffusers layout is not supported). Setting it to the
+repo id `krea/Krea-2-Raw` also works: the single-file checkpoint is downloaded for
+you (set `HF_TOKEN` for the gated repo). Non-default filenames:
+`model.model_kwargs.checkpoint_filename`.
 
 ## Dataset layout
 
