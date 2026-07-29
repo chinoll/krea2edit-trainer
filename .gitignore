@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+smoke/
+smoke_data/
+output/
