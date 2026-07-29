@@ -26,11 +26,7 @@ SELECT_LAYERS: tuple[int, ...] = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35)
 PROMPT_TEMPLATE_ENCODE_PREFIX = (
     "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
     "texture, quantity, text, spatial relationships of the objects and "
-    "background" + (
-    ". For any person, describe their exact facial identity in fine detail: face shape,"
-    " eye shape and color, brows, nose, lips, jaw, skin texture, distinctive marks,"
-    " hairline and any asymmetries" if __import__("os").environ.get("KREA2_GROUNDING_IDENTITY") == "1" else "")
-    + ":<|im_end|>\n<|im_start|>user\n"
+    "background:<|im_end|>\n<|im_start|>user\n"
 )
 PROMPT_TEMPLATE_ENCODE_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
 
