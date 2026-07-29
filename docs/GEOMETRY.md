@@ -12,6 +12,8 @@ geometry will misregister at inference (blur, off-center ghosting, seam artifact
 [ text tokens | ref_1 tokens | ... | ref_N tokens | target tokens ]
 ```
 
+- `N ≤ 2`: the inference nodes expose exactly two reference inputs (`source_image`,
+  `source_image_b`), so the trainer refuses more than two references.
 - The transformer input is one joint sequence. References are clean (un-noised) VAE
   latents; only target tokens receive flow-matching noise, and **only target tokens
   contribute to the loss** (the predicted-flow slice for refs is discarded).
@@ -27,7 +29,9 @@ Each image token carries `(frame, h, w)`:
 
 ## 3. Reference fit protocol (`fit_refs`)
 
-References are AR-preserving **fitted inside** the target token grid:
+`model_kwargs: {fit_refs: true}` is the trainer default and corresponds to the node's
+`fit_mode: "fit"` (also its default). References are AR-preserving **fitted inside**
+the target token grid:
 
 1. Compute scale `s = min(target_h/src_h, target_w/src_w)` in pixel space.
 2. Token grid dims must be exact multiples of 16 px. **Do not floor-resize the scaled
@@ -52,9 +56,18 @@ The instruction is encoded by Qwen3-VL-4B **together with the reference images**
   reference, in frame order**, followed by the instruction text.
 - Output: hidden states of 12 selected layers `(2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35)`
   stacked to `(1, L, 12, hidden)`, with the first 34 tokens (system prefix) sliced off.
-- The grounding image is the reference at **native resolution** (pre-fit), optionally
-  downscaled: longest side capped at `GROUNDING_MAX_PX` with per-step uniform jitter
-  down to `GROUNDING_JITTER_MIN`. Jitter is a train-time augmentation — which is why
+- Under the fit protocol (`fit_refs: true`, the default) the grounding image is the
+  reference as delivered by the loader, i.e. at its **native resolution, before the
+  fit-to-target-grid resample** — the semantic path and the appearance path see
+  different pixels on purpose. This is only true under the fit protocol: with
+  `fit_refs: false` (legacy crop geometry) the loader hands over an already
+  target-sized control tensor, so the grounding image is the cropped/resized
+  reference, not the native one.
+- The grounding image is then optionally downscaled: longest side capped at
+  `GROUNDING_MAX_PX` (default **768**, matching the inference node's `grounding_px`)
+  with per-step uniform jitter down to `GROUNDING_JITTER_MIN` (default **384**).
+  Both env vars override the defaults; `0` disables the cap. Jitter is a train-time
+  augmentation — which is why
   **text-embedding caching must stay off** for edit datasets: a cached embedding
   freezes one grounding scale and the LoRA loses scale robustness.
 

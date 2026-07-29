@@ -16,7 +16,6 @@ is the part to validate first — start with the recon sanity run in docs/STAGE0
 """
 import os
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from typing import TYPE_CHECKING, List, Optional
 from einops import rearrange, repeat
@@ -36,6 +35,28 @@ from .src.text_encoder import (
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
+
+
+# The comfyui-krea2edit inference nodes expose exactly two reference inputs
+# (source_image + source_image_b). A LoRA trained with more references cannot be
+# reproduced at inference, so training refuses to produce one.
+MAX_REFS = 2
+
+# Grounding (semantic path) resolution policy. These defaults MATCH the inference
+# node: comfyui-krea2edit's Krea2EditTextEncode defaults `grounding_px` to 768, and
+# the released krea2-identity-edit LoRAs trained with per-step jitter down to 384.
+# Env vars still override at launch (0 disables the cap = native-resolution
+# grounding, which is NOT what the released weights were trained with).
+GROUNDING_MAX_PX_DEFAULT = "768"
+GROUNDING_JITTER_MIN_DEFAULT = "384"
+
+
+def grounding_settings():
+    """(max_px, jitter_min) for the Qwen3-VL grounding image; env overrides defaults."""
+    return (
+        int(os.environ.get("GROUNDING_MAX_PX", GROUNDING_MAX_PX_DEFAULT)),
+        int(os.environ.get("GROUNDING_JITTER_MIN", GROUNDING_JITTER_MIN_DEFAULT)),
+    )
 
 
 def _img_tokens_and_pos(latent: torch.Tensor, patch: int, frame: int):
@@ -81,10 +102,16 @@ def predict_velocity_edit(
 
     if not isinstance(source_latents, (list, tuple)):
         source_latents = [source_latents]
+    if len(source_latents) > MAX_REFS:
+        raise ValueError(
+            f"krea2_edit: {len(source_latents)} reference latents in the token sequence, "
+            f"but the comfyui-krea2edit nodes accept at most {MAX_REFS} references "
+            "(source_image + source_image_b). Training with more would produce a LoRA "
+            "the inference nodes cannot reproduce."
+        )
 
     tgt_tok, tgt_pos, tgt_mask = _img_tokens_and_pos(target_latents, patch, frame=0)
     src_toks, src_poss, src_masks, src_len = [], [], [], 0
-    _drop = float(os.environ.get("KREA2_REF_TOKEN_DROPOUT", "0"))
     for i, sl in enumerate(source_latents):
         tok, pos_i, mask_i = _img_tokens_and_pos(sl, patch, frame=i + 1)
         if fit_offsets:
@@ -94,11 +121,6 @@ def predict_velocity_edit(
             # continuous floats, so the exact center is representable.
             pos_i[..., 1] += max(0.0, (h // patch - gh) / 2)
             pos_i[..., 2] += max(0.0, (w // patch - gw) / 2)
-        if _drop > 0 and model.training and tok.shape[1] > 16:
-            keep = torch.rand(tok.shape[1], device=tok.device) >= _drop
-            if keep.sum() < 8:
-                keep[:8] = True
-            tok, pos_i, mask_i = tok[:, keep], pos_i[:, keep], mask_i[:, keep]
         src_toks.append(tok); src_poss.append(pos_i); src_masks.append(mask_i)
         src_len += tok.shape[1]
 
@@ -126,21 +148,34 @@ class Krea2EditModel(Krea2Model):
         # route the control image to get_prompt_embeds (semantic grounding)
         self.encode_control_in_text_embeddings = True
         self._control_latents = None  # Tensor (single-ref) or List[Tensor] (multi-ref)
-        # NATIVE-AR REFS (v1.2): refs keep their own aspect/size on their own RoPE
-        # grid (predict_velocity_edit is already ragged-capable). Loader delivers
-        # raw control images via control_tensor_list when this is on.
-        self.native_refs = bool((model_config.model_kwargs or {}).get("native_refs", False))
         # FIT protocol (s1e, 2026-07-14): refs resampled to target grid density
         # (AR-preserving fit-inside, no crop, no pad tokens), placed at centered
-        # stride-1 integer offsets — matches the node's `fit` inference mode.
-        self.fit_refs = bool((model_config.model_kwargs or {}).get("fit_refs", False))
-        self.use_raw_control_images = self.native_refs or self.fit_refs
-        if self.native_refs:
-            print("[krea2_edit] NATIVE-AR refs ENABLED (own grids, no crop/stretch)")
+        # fractional offsets — matches the node's `fit` inference mode, which is
+        # also the node's DEFAULT. Default ON here so a stock clone reproduces the
+        # released recipe; `model_kwargs: {fit_refs: false}` is an explicit opt-in
+        # to the legacy v1/v1.1 crop geometry.
+        self.fit_refs = bool((model_config.model_kwargs or {}).get("fit_refs", True))
+        self.use_raw_control_images = self.fit_refs
         if self.fit_refs:
-            print("[krea2_edit] FIT refs ENABLED (target-density resample, centered offsets)")
-        self._fp8_enabled = False
-        self._nf4_enabled = False
+            print("[krea2_edit] FIT refs ENABLED (target-density resample, centered offsets) "
+                  "— matches node fit_mode: 'fit' (the node default)")
+        else:
+            bar = "!" * 78
+            print(bar)
+            print("[krea2_edit] WARNING: fit_refs=false -> LEGACY v1/v1.1 CROP reference geometry.")
+            print("[krea2_edit]   References are center-cropped to the target aspect ratio before")
+            print("[krea2_edit]   resize. A LoRA trained this way ONLY reproduces at inference with")
+            print("[krea2_edit]   fit_mode: 'crop (legacy)' in the comfyui-krea2edit node — the node")
+            print("[krea2_edit]   defaults to 'fit' and will misregister this LoRA otherwise.")
+            print("[krea2_edit]   The released krea2-identity-edit LoRAs used fit_refs: true.")
+            print(bar)
+        # Grounding policy, printed once so every run is self-documenting.
+        _g_max, _g_jit = grounding_settings()
+        print(f"[krea2_edit] grounding: GROUNDING_MAX_PX={_g_max} GROUNDING_JITTER_MIN={_g_jit} "
+              f"(recipe defaults 768/384; 0 = off/native resolution)")
+        if _g_max <= 0:
+            print("[krea2_edit] WARNING: grounding cap disabled -> the VLM sees native-resolution "
+                  "references, which is NOT the released recipe (node default grounding_px=768).")
         # multi_ref: true (model_kwargs) -> OpenSubject-style [scene, subject] dual conditioning.
         # Dataloader delivers stacked controls (B, N, C, H, W); each ref becomes its own
         # frame-indexed token block + its own vision block in the Qwen3-VL grounding.
@@ -148,14 +183,92 @@ class Krea2EditModel(Krea2Model):
         if self.multi_ref:
             self.has_multiple_control_images = True
             print("[krea2_edit] multi_ref ENABLED: N-control conditioning (frames 1..N)")
+        self._validate_raw_control_training_config()
+
+    # ------------------------------------------------------------------
+    # Guards: refuse configurations the inference nodes cannot reproduce
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_owning_train_process():
+        """Best-effort handle on the ai-toolkit train process constructing this model.
+
+        ai-toolkit hands a model class only its ModelConfig — there is no official
+        view of train/dataset config from here — but the process instance is a local
+        of the calling frame (``BaseSDTrainProcess.load_model`` -> ``ModelClass(...)``),
+        so the guards below can read batch_size and the dataset flip flags. Returns
+        None when we are not being constructed by a train process (plain import,
+        third-party harness); the guards then no-op and the README restrictions
+        apply on the honor system.
+        """
+        import inspect
+        frame = inspect.currentframe()
+        try:
+            while frame is not None:
+                obj = frame.f_locals.get("self", None)
+                if (obj is not None and hasattr(obj, "train_config")
+                        and hasattr(obj, "dataset_configs")):
+                    return obj
+                frame = frame.f_back
+        except Exception:
+            return None
+        finally:
+            del frame
+        return None
+
+    def _validate_raw_control_training_config(self):
+        """Hard-fail configs that silently corrupt fit-protocol training."""
+        if not self.use_raw_control_images:
+            return
+        proc = self._find_owning_train_process()
+        if proc is None:
+            print("[krea2_edit] NOTE: train config not visible from the model class; the "
+                  "batch_size and flip-augmentation guards were skipped. With the fit "
+                  "protocol you MUST use batch_size: 1 and flip_x/flip_y: false "
+                  "(see README, 'Not supported').")
+            return
+        batch_size = int(getattr(proc.train_config, "batch_size", 1) or 1)
+        if batch_size > 1:
+            raise ValueError(
+                f"krea2_edit: batch_size={batch_size} is not supported with the fit "
+                "reference protocol (fit_refs: true, the default).\n"
+                "  ai-toolkit collates raw control images with torch.cat, which requires "
+                "every source image in a batch to have identical pixel dimensions — a "
+                "mixed-size dataset crashes mid-run.\n"
+                "  Use train.batch_size: 1 (raise gradient_accumulation instead), or set "
+                "model_kwargs.fit_refs: false to fall back to the legacy crop geometry "
+                "(which then requires fit_mode: 'crop (legacy)' at inference)."
+            )
+        flipped = [
+            getattr(d, "folder_path", "<dataset>")
+            for d in (getattr(proc, "dataset_configs", None) or [])
+            if getattr(d, "flip_x", False) or getattr(d, "flip_y", False)
+        ]
+        if flipped:
+            raise ValueError(
+                "krea2_edit: flip augmentation (flip_x / flip_y) is not supported with the "
+                "fit reference protocol (fit_refs: true, the default).\n"
+                "  ai-toolkit flips the TARGET image but not the raw control (reference) "
+                "images, so every flipped pair is silently desynced — the LoRA is trained "
+                "on mirrored supervision.\n"
+                f"  Offending dataset(s): {flipped}\n"
+                "  Set flip_x: false / flip_y: false, or pre-flip your pairs offline."
+            )
+
+    @staticmethod
+    def _check_ref_count(n_refs: int):
+        """The nodes take at most two references — refuse to train an unusable LoRA."""
+        if n_refs > MAX_REFS:
+            raise ValueError(
+                f"krea2_edit: {n_refs} reference images resolved for a sample, but the "
+                f"comfyui-krea2edit nodes accept at most {MAX_REFS} references "
+                "(source_image + source_image_b).\n"
+                "  A LoRA trained with more reference token blocks cannot be reproduced "
+                "at inference.\n"
+                "  Use at most two control_path entries per dataset."
+            )
 
     def load_model(self):
         super().load_model()
-        fp8_ckpt = self.model_config.model_kwargs.get("fp8_checkpoint", None)
-        if fp8_ckpt:
-            self._patch_fp8_linears(fp8_ckpt)
-        if self.model_config.model_kwargs.get("nf4", False):
-            self._patch_nf4_linears()
         ckpt_n = self.model_config.model_kwargs.get("checkpoint_every_n", 1)
         if ckpt_n > 1:
             self.transformer.checkpoint_every_n = ckpt_n
@@ -164,99 +277,24 @@ class Krea2EditModel(Krea2Model):
                 f"({len(self.transformer.blocks) // ckpt_n} of {len(self.transformer.blocks)} checkpointed)"
             )
 
-    def _patch_fp8_linears(self, fp8_ckpt: str):
-        """Replace block Linear forwards with pre-quantized FP8 GEMM.
+    # ------------------------------------------------------------------
+    # In-training previews: unsupported for the edit arch
+    # ------------------------------------------------------------------
+    _NO_SAMPLING_MSG = (
+        "krea2_edit: in-training sample previews are not supported for this architecture.\n"
+        "  ai-toolkit's sampling path renders the inherited plain-T2I pipeline: no "
+        "reference token blocks (frame>=1) and no image-grounded Qwen3-VL encode, so the "
+        "previews show what the LoRA does WITHOUT the edit conditioning — misleading at "
+        "best.\n"
+        "  Set train.disable_sampling: true and evaluate checkpoints in ComfyUI with the "
+        "comfyui-krea2edit nodes."
+    )
 
-        Loads pre-quantized FP8 weights + scales from the checkpoint, wraps each
-        block Linear as an FP8Linear (nn.Linear subclass — LoRA still finds it),
-        and caches the FP8 weight for zero-cost weight quantization during training.
+    def get_generation_pipeline(self):
+        raise NotImplementedError(self._NO_SAMPLING_MSG)
 
-        Must be called AFTER super().load_model() (transformer on GPU) and BEFORE
-        the LoRA network is applied by the trainer.
-        """
-        from .fp8_linear import FP8Linear
-        from safetensors.torch import load_file as load_safetensors
-
-        fp8_sd = load_safetensors(fp8_ckpt)
-        n_patched = 0
-        freed_bytes = 0
-        for name, mod in self.model.named_modules():
-            if not isinstance(mod, nn.Linear):
-                continue
-            parts = name.split(".")
-            if len(parts) < 4 or parts[0] != "blocks" or parts[2] not in ("attn", "mlp"):
-                continue
-            sd_key = name + ".weight"
-            scale_key = sd_key + "_fp8_scale"
-            if sd_key not in fp8_sd or scale_key not in fp8_sd:
-                continue
-            freed_bytes += mod.weight.numel() * mod.weight.element_size()
-            mod.__class__ = FP8Linear
-            mod._fp8_weight = None
-            mod._fp8_weight_t = None
-            mod._fp8_scale = None
-            mod.use_fp8 = True
-            mod.load_fp8(fp8_sd[sd_key], fp8_sd[scale_key], drop_bf16=True, store_transposed=True)
-            n_patched += 1
-
-        self._fp8_enabled = True
-        del fp8_sd
-        from toolkit.basic import flush
-        flush()
-        self.print_and_status_update(
-            f"FP8 training: {n_patched} block Linears on FP8, "
-            f"freed {freed_bytes / 1e9:.1f} GB BF16 weights"
-        )
-
-    def _patch_nf4_linears(self):
-        """Replace block Linears with bnb NF4 (Linear4bit) — the QLoRA base.
-
-        Frozen 4-bit base + bf16 LoRA on top. The LoRA wraps via forward-interception
-        (lora_special.apply_to captures org_module.forward), so bnb's fused 4-bit matmul
-        stays intact under the adapter. Gated on model_kwargs.nf4; called after
-        super().load_model() and BEFORE the LoRA network is applied. Needs 'Linear4bit'
-        registered in lora_special.LINEAR_MODULES so the LoRA targets it. On the Spark's
-        unified memory the cpu round-trip (to force NF4 quantization on the cuda move) is
-        effectively free.
-        """
-        import bitsandbytes as bnb
-        from toolkit.basic import flush
-
-        targets = []
-        for name, mod in self.model.named_modules():
-            if not isinstance(mod, nn.Linear):
-                continue
-            parts = name.split(".")
-            if len(parts) < 4 or parts[0] != "blocks" or parts[2] not in ("attn", "mlp"):
-                continue
-            targets.append((name, mod))
-
-        n_patched = 0
-        freed_bytes = 0
-        for name, mod in targets:
-            freed_bytes += mod.weight.numel() * mod.weight.element_size()
-            has_bias = mod.bias is not None
-            w_cpu = mod.weight.data.detach().to("cpu", torch.bfloat16)
-            new = bnb.nn.Linear4bit(
-                mod.in_features, mod.out_features, bias=has_bias,
-                compute_dtype=torch.bfloat16, quant_type="nf4",
-            )
-            new.weight = bnb.nn.Params4bit(w_cpu, requires_grad=False, quant_type="nf4")
-            if has_bias:
-                new.bias = nn.Parameter(
-                    mod.bias.data.detach().to("cpu", torch.bfloat16), requires_grad=False
-                )
-            new = new.to(self.device_torch)  # Params4bit cpu->cuda triggers NF4 quantization
-            parent = self.model.get_submodule(".".join(name.split(".")[:-1]))
-            setattr(parent, name.split(".")[-1], new)
-            n_patched += 1
-
-        self._nf4_enabled = True
-        flush()
-        self.print_and_status_update(
-            f"NF4 QLoRA: {n_patched} block Linears -> bnb Linear4bit (nf4, compute bf16), "
-            f"freed {freed_bytes / 1e9:.1f} GB BF16 weights"
-        )
+    def generate_single_image(self, *args, **kwargs):
+        raise NotImplementedError(self._NO_SAMPLING_MSG)
 
     def _load_text_encoder(self):
         """Same as Krea2Model but KEEP the Qwen3-VL vision tower.
@@ -288,39 +326,26 @@ class Krea2EditModel(Krea2Model):
     # --- appearance path: stash the source latent for the prediction step ---
     @staticmethod
     def _fit_ref(x, th, tw):
-        """Center-crop to the target aspect ratio, then resize. Direct
-        interpolate (pre-2026-07-07) STRETCHED mixed-AR refs and taught an
-        inverse-squash prior on faces (v1 post-release finding). Center crop
-        matches the shipped inference recipe. Env KREA2_REF_FIT=stretch
-        restores the old behavior for lineage reproduction."""
-        import os
+        """LEGACY (fit_refs: false) crop geometry: center-crop to the target aspect
+        ratio, then resize. Mirrors the node's fit_mode: 'crop (legacy)'.
+
+        Direct interpolate (pre-2026-07-07) STRETCHED mixed-AR refs and taught an
+        inverse-squash prior on faces (v1 post-release finding); that known-bad path
+        is gone — center crop is the only legacy behavior the nodes reproduce."""
         sh, sw = x.shape[2], x.shape[3]
         if sh == th and sw == tw:
             return x
-        if os.environ.get("KREA2_REF_FIT", "crop") != "stretch":
-            tar, sar = tw / th, sw / sh
-            if abs(sar - tar) > 1e-3:
-                if sar > tar:  # ref too wide -> crop width
-                    nw = max(1, int(round(sh * tar)))
-                    x0 = (sw - nw) // 2
-                    x = x[:, :, :, x0:x0 + nw]
-                else:          # ref too tall -> crop height
-                    nh = max(1, int(round(sw / tar)))
-                    y0 = (sh - nh) // 2
-                    x = x[:, :, y0:y0 + nh, :]
+        tar, sar = tw / th, sw / sh
+        if abs(sar - tar) > 1e-3:
+            if sar > tar:  # ref too wide -> crop width
+                nw = max(1, int(round(sh * tar)))
+                x0 = (sw - nw) // 2
+                x = x[:, :, :, x0:x0 + nw]
+            else:          # ref too tall -> crop height
+                nh = max(1, int(round(sw / tar)))
+                y0 = (sh - nh) // 2
+                x = x[:, :, y0:y0 + nh, :]
         return F.interpolate(x, size=(th, tw), mode="bilinear")
-
-    def _native_prep(self, c, th_px, tw_px):
-        """Native ref prep: keep AR, snap dims to /16, cap area at ~1.4x target
-        (bounds sequence cost; still far more info than a crop)."""
-        _, _, h, w = c.shape
-        cap = float(os.environ.get("KREA2_NATIVE_CAP", "1.4")) * th_px * tw_px
-        sc = min(1.0, (cap / (h * w)) ** 0.5)
-        nh = max(16, int(round(h * sc / 16)) * 16)
-        nw = max(16, int(round(w * sc / 16)) * 16)
-        if (nh, nw) != (h, w):
-            c = F.interpolate(c, size=(nh, nw), mode="bilinear", antialias=True)
-        return c
 
     def _fit_prep(self, c, th_px, tw_px):
         """Fit protocol prep: AR-preserving resize to fit INSIDE the target, floor
@@ -361,20 +386,23 @@ class Krea2EditModel(Krea2Model):
             ctrl = getattr(batch, "control_tensor", None)
             ctrl_list = getattr(batch, "control_tensor_list", None)
             if ctrl is None and ctrl_list:
-                # native-AR path: ragged per-item ref list (batch collates B=1)
+                # raw-control path: ragged per-item ref list (batch collates B=1)
                 th_px, tw_px = (batch.tensor.shape[2], batch.tensor.shape[3]) if batch.tensor is not None \
                     else (batch.file_items[0].crop_height, batch.file_items[0].crop_width)
                 refs = ctrl_list[0] if isinstance(ctrl_list[0], (list, tuple)) else ctrl_list
+                self._check_ref_count(len(refs))
                 lats = []
                 for c in refs:
                     if c.dim() == 3:
                         c = c.unsqueeze(0)
                     c = (c * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
-                    c = self._fit_prep(c, th_px, tw_px) if self.fit_refs else self._native_prep(c, th_px, tw_px)
+                    c = self._fit_prep(c, th_px, tw_px) if self.fit_refs \
+                        else self._fit_ref(c, th_px, tw_px)
                     lats.append(self.encode_images(c).to(latents.device, latents.dtype))
                 self._control_latents = lats if len(lats) > 1 else lats[0]
                 if not getattr(self, "_edit_path_logged", False):
-                    print(f"[krea2_edit] {'FIT' if self.fit_refs else 'NATIVE'} refs: {[tuple(l.shape[-2:]) for l in lats]} "
+                    print(f"[krea2_edit] {'FIT' if self.fit_refs else 'CROP (legacy)'} refs: "
+                          f"{[tuple(l.shape[-2:]) for l in lats]} "
                           f"for target {tuple(latents.shape[-2:])}", flush=True)
                     self._edit_path_logged = True
                 return latents.detach()
@@ -397,6 +425,7 @@ class Krea2EditModel(Krea2Model):
                         return c_
                     return self._fit_ref(c_, th, tw)
                 if ctrl.dim() == 5:  # multi-ref: (B, N, C, H, W) -> list of per-ref latents
+                    self._check_ref_count(ctrl.shape[1])
                     lats = []
                     for i in range(ctrl.shape[1]):
                         c_i = (ctrl[:, i] * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
@@ -498,7 +527,7 @@ class Krea2EditModel(Krea2Model):
                 per_item = [[control_images.squeeze(0) if control_images.dim() == 4 else control_images]] * len(prompt)
         elif isinstance(control_images, (list, tuple)):
             if control_images and isinstance(control_images[0], (list, tuple)):
-                # native-refs path: list of per-item ref LISTS (ragged sizes)
+                # raw-control path: list of per-item ref LISTS (ragged sizes)
                 per_item = [[(im.squeeze(0) if torch.is_tensor(im) and im.dim() == 4 else im)
                              for im in item] for item in control_images]
                 if len(per_item) == 1 and len(prompt) > 1:
@@ -526,18 +555,21 @@ class Krea2EditModel(Krea2Model):
         vision tokens ~(native/cap)^2 with little semantic loss, shrinking the DiT's text
         stream (faster steps) and the TE forward (faster on-the-fly encoding).
 
-        GROUNDING_MAX_PX     (int, 0=off): cap the longest side fed to Qwen3-VL.
-        GROUNDING_JITTER_MIN (int, 0=off): with MAX_PX set, sample the cap per call from
-            uniform[MIN, MAX_PX] -> the model learns granularity/length robustness, so
-            inference may freely use native-res grounding without a train/infer mismatch.
+        Defaults are the released recipe (max 768 / jitter min 384) and match the
+        inference node's grounding_px default; the env vars only override them.
+
+        GROUNDING_MAX_PX     (int, default 768, 0=off): cap the longest side fed to Qwen3-VL.
+        GROUNDING_JITTER_MIN (int, default 384, 0=off): with MAX_PX set, sample the cap per
+            call from uniform[MIN, MAX_PX] -> the model learns granularity/length
+            robustness, so inference may freely use other grounding scales without a
+            train/infer mismatch.
         """
         from PIL import Image
         import numpy as np
         import random
         arr = (image.detach().float().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
         pil = Image.fromarray(arr.transpose(1, 2, 0))
-        cap = int(os.environ.get("GROUNDING_MAX_PX", "0"))
-        jmin = int(os.environ.get("GROUNDING_JITTER_MIN", "0"))
+        cap, jmin = grounding_settings()
         if cap > 0:
             tgt = random.randint(jmin, cap) if 0 < jmin < cap else cap
             if max(pil.size) > tgt:

@@ -2,8 +2,14 @@
 # Measured peak: 28.1 GB — fits 32 GB cards comfortably. For 24 GB see the README
 # VRAM section (requires cache_text_embeddings: true, with its tradeoff).
 #
-# Launch (grounding env vars are part of the recipe):
+# Launch (no env vars needed — the trainer already defaults to the released recipe's
+# grounding: max 768 / jitter min 384, matching the inference node's grounding_px):
+#   python run.py configs/krea2_edit_lora_512.yaml
+#
+# GROUNDING_MAX_PX / GROUNDING_JITTER_MIN are OPTIONAL overrides. A higher cap, e.g.
 #   GROUNDING_MAX_PX=1024 GROUNDING_JITTER_MIN=384 python run.py configs/krea2_edit_lora_512.yaml
+# is NOT what the released krea2-identity-edit weights trained with, and costs VRAM
+# and step time.
 #
 # All numeric values here (steps, repeats, lr) are GENERIC STARTING POINTS —
 # tune them for your dataset. See README for the dataset layout.
