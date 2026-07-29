@@ -1,7 +1,9 @@
-# Krea 2 Identity Edit LoRA — 1024px full-recipe example (~32 GB)
+# Krea 2 Identity Edit LoRA — 1024px finishing-pass config (r128, fp8)
+# EXCEEDS consumer cards (measured r64@768 = 30.9 GB; 1024 is higher still).
+# Intended as a short warm-started finishing pass on rented 48 GB+ hardware.
 #
 # Launch (grounding env vars are part of the recipe):
-#   GROUNDING_MAX_PX=1024 GROUNDING_JITTER_MIN=384 python run.py configs/krea2_edit_lora_1024.yaml
+#   GROUNDING_MAX_PX=1024 GROUNDING_JITTER_MIN=384 python run.py configs/krea2_edit_lora_1024_finish.yaml
 #
 # All numeric values here (steps, repeats, lr) are GENERIC STARTING POINTS —
 # tune them for your dataset. See README for the dataset layout.

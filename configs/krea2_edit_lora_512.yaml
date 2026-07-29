@@ -1,7 +1,9 @@
-# Krea 2 Identity Edit LoRA — 24 GB example config
+# Krea 2 Identity Edit LoRA — 512px bulk-stage config (r64, fp8)
+# Measured peak: 28.1 GB — fits 32 GB cards comfortably. For 24 GB see the README
+# VRAM section (requires cache_text_embeddings: true, with its tradeoff).
 #
 # Launch (grounding env vars are part of the recipe):
-#   GROUNDING_MAX_PX=1024 GROUNDING_JITTER_MIN=384 python run.py configs/krea2_edit_lora_24gb.yaml
+#   GROUNDING_MAX_PX=1024 GROUNDING_JITTER_MIN=384 python run.py configs/krea2_edit_lora_512.yaml
 #
 # All numeric values here (steps, repeats, lr) are GENERIC STARTING POINTS —
 # tune them for your dataset. See README for the dataset layout.
