@@ -76,18 +76,48 @@ my_dataset/
 - Rank: useful capacity saturates well below what you might expect — r64–128 is a
   good default; go higher only if you measure a reason to.
 
-## VRAM guidance (estimates — reports welcome)
+## VRAM: measured requirements — read before filing an issue
 
-| Tier | Setup | Notes |
-|---|---|---|
-| 32 GB | fp8 base (`quantize: true`), 512px, r128 | field-tested: 27.5–31.3 GB observed in beta testing |
-| 24 GB | fp8 base, 512px, r64 | expected tight — likely needs cached text embeddings (costs grounding-jitter robustness) until the planned multi-scale grounding cache lands; reports welcome |
-| 16 GB | *planned* — needs the cached-variant grounding mode (tracked in issues) | not yet supported |
+These are **measured peak CUDA allocations** (fp8-quantized base + fp8 TE, batch 1,
+gradient checkpointing, latent caching on, text embeddings NOT cached — i.e. the full
+recipe with per-step grounding jitter, everything resident). Your card needs the peak
+plus ~1–2 GB driver/display overhead.
 
-Reference envelope: full-bf16 (no quantization, TE resident) peaks at **42 GB** for
-512px/r16 — measured on unified-memory hardware where nothing offloads, i.e. the
-worst-case all-on-device figure. Quantization brings the base 26→13 GB and the TE
-8→4 GB.
+| Config | Peak alloc | Fits on |
+|---|---:|---|
+| r64 @512 | **28.1 GB** | 32 GB cards, comfortably |
+| r128 @512 | **32.0 GB** | does NOT fit 32 GB as-is — use 8-bit AdamW (~29 GB) or cached embeddings |
+| r64 @768 | **30.9 GB** | 32 GB cards, tight (leave headroom: headless card recommended) |
+| r16 @512, full bf16 (no quant) | 42.1 GB | reference worst case |
+
+Field cross-check: independent beta testing on a 32 GB card (r128 @512, uncached)
+read 31.3 GB and fell into PCIe offload — matching the table.
+
+**What this means per card:**
+
+- **32 GB**: the sweet spot. r64 @512 uncached runs the full recipe. r128 wants 8-bit
+  AdamW or cached embeddings.
+- **24 GB**: only with **cached text embeddings** (`cache_text_embeddings: true`),
+  which evicts the 4 GB TE and lands ~24 GB — borderline, and caching freezes ONE
+  grounding scale, trading away the scale-robustness the jitter provides. A
+  multi-scale grounding cache that removes this tradeoff is planned (tracked in
+  issues).
+- **16 GB**: **not supported today.** Please don't file issues asking why 1024
+  training OOMs on 16 GB — the base model alone is 13 GB quantized. The planned
+  grounding-cache mode plus aggressive settings may eventually enable 512px here.
+- **1024px training**: not a consumer-card recipe. Expect it to exceed 32 GB
+  even quantized. The shipped models did the bulk of their training at 512 and used
+  1024 only for a short finishing pass — do that pass on rented hardware (an A6000/
+  L40S-class 48 GB card or better).
+
+**Troubleshooting install/env issues (found the hard way):**
+
+- Install ai-toolkit's own `requirements.txt` exactly. A stale `diffusers` breaks
+  aitk's *built-in* extensions with an opaque `Error running on_error` crash before
+  this extension even loads.
+- `adamw8bit` requires a bitsandbytes build matching your CUDA; if bnb prints a
+  library-load error at startup it is harmless *unless* you selected an 8-bit
+  optimizer — then switch to `adamw`.
 
 Example configs are in `configs/`. Values in them (steps, repeats, learning rate)
 are **generic starting points** — tune for your dataset.
