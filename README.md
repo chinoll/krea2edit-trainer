@@ -3,6 +3,9 @@
 *Community project — not affiliated with or endorsed by Krea.ai. "Krea" is used
 descriptively to identify the base model this trainer targets.*
 
+☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU
+compute for future versions.
+
 This is the actual training code behind the released
 [krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit) LoRAs —
 not a reimplementation. Its reference geometry is byte-matched to the
