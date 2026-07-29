@@ -17,6 +17,15 @@ It adds one model architecture to [ai-toolkit](https://github.com/ostris/ai-tool
 (Plain Krea 2 text-to-image training is already built into upstream ai-toolkit as
 `arch: "krea2"` — this extension doesn't duplicate it.)
 
+**Note on upstream's own edit mode:** ai-toolkit's built-in `krea2` arch also offers
+an edit mode (`model_kwargs: {edit: true}`). It is a *different training contract* —
+a "Picture N:"-labeled grounding template and an area-budget reference resize —
+whereas this extension implements the exact grounding template and fit-to-target-grid
+reference geometry that the comfyui-krea2edit nodes (and the released
+krea2-identity-edit LoRAs) use. Both are valid trainers; they are not interchangeable.
+If you want LoRAs that pair with the identity-edit inference stack, train with
+`arch: "krea2_edit"` from this extension.
+
 ## Install
 
 ```bash
