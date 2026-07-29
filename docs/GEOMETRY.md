@@ -66,10 +66,18 @@ The instruction is encoded by Qwen3-VL-4B **together with the reference images**
 - The grounding image is then optionally downscaled: longest side capped at
   `GROUNDING_MAX_PX` (default **768**, matching the inference node's `grounding_px`)
   with per-step uniform jitter down to `GROUNDING_JITTER_MIN` (default **384**).
-  Both env vars override the defaults; `0` disables the cap. Jitter is a train-time
-  augmentation — which is why
+  Both env vars override the defaults; `0` disables the cap. The downscale kernel is
+  PIL `LANCZOS` here; the inference node uses `common_upscale(..., "area")`. Jitter is
+  a train-time augmentation — which is why
   **text-embedding caching must stay off** for edit datasets: a cached embedding
   freezes one grounding scale and the LoRA loses scale robustness.
+- **Cache invalidation is manual.** ai-toolkit's text-embedding cache key does not
+  include the grounding settings, so changing `GROUNDING_MAX_PX` /
+  `GROUNDING_JITTER_MIN` does *not* invalidate an existing cache. If you train with
+  `cache_text_embeddings: true` and change either value, delete the `_t_e_cache`
+  folders under your dataset directories first — otherwise the run keeps feeding
+  embeddings built at the previous grounding resolution and this section no longer
+  describes what the model actually sees.
 
 ## 5. Objective
 

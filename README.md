@@ -13,8 +13,11 @@ not a reimplementation. Its reference geometry is geometry-matched to the
 (v1.2.4+), so what you train is what the nodes run. "Geometry-matched" is exact about
 the things that misregister — fit dimensions, crop rectangles, and the centered
 fractional RoPE offsets are identical — but the two stacks do *not* use the same
-resample kernel (this trainer resizes references with bilinear + antialias, the node
-with bicubic + antialias), so reference pixels differ slightly below the geometry.
+resample kernel, so reference pixels differ slightly below the geometry: the fit
+path resizes with bilinear + antialias here vs bicubic + antialias in the node, the
+legacy `fit_refs: false` crop path uses bilinear **without** antialias, and the
+grounding downscale uses PIL `LANCZOS` here vs `common_upscale(..., "area")` in the
+node. Geometry is exact; kernels are not.
 
 It adds one model architecture to [ai-toolkit](https://github.com/ostris/ai-toolkit):
 
@@ -41,7 +44,19 @@ git clone https://github.com/lbouaraba/krea2edit-trainer krea2_edit
 ```
 
 That's it — ai-toolkit discovers extensions in that folder. Set `arch: "krea2_edit"`
-in your config.
+in your config. Python **3.10+** is required (the source uses PEP 604 `X | None`
+annotations at runtime).
+
+**This extension is CLI-only** (`python run.py <config>`): ai-toolkit's web UI job
+builder has a hardcoded architecture list that does not include `krea2_edit`, so the
+arch will not appear there. Write the YAML config and launch it from the command
+line — and launch **from the ai-toolkit root**, because ai-toolkit resolves a config
+path against its own `config/` folder and then the current directory:
+
+```bash
+cd ai-toolkit
+python run.py extensions/krea2_edit/configs/krea2_edit_lora_512.yaml
+```
 
 ## Model access
 
@@ -70,12 +85,31 @@ my_dataset/
 
 - `folder_path` → `targets/`, `control_path` → `["sources/"]` (add `sources_b/` for
   two-reference training; references appear in the token sequence in list order).
+- **Every target needs a stem-matched source.** ai-toolkit pairs by filename stem
+  only: for `targets/0001.png` it looks for `sources/0001.{jpg,jpeg,png,webp}`.
+  Extensions may differ, stems may not. A target with no match keeps its caption,
+  loses its reference, and **silently trains as plain T2I** — so an off-by-one naming
+  slip degrades the run without any error. The trainer now audits the pairing at
+  startup (filenames only) and refuses to start if any target is unpaired; it also
+  warns loudly if a two-reference dataset has targets matched by only one of the two
+  `control_path` folders (those items shift reference order — a target matched only
+  by `sources_b/` gets it as reference #1).
 - The caption is the *instruction* ("place her on a beach at sunset"), not a
   description of the target.
 - Targets-only datasets (no `control_path`) train as plain T2I through the same arch —
-  useful as regularization.
-- **`cache_text_embeddings: false` is required** for edit datasets: text conditioning
-  is image-grounded and jittered per step (see below), so it must not be cached.
+  useful as regularization. Keep them as their own dataset entry; don't leave
+  unpaired targets sitting in an edit dataset.
+- **`cache_text_embeddings` must be `false`** to keep the per-step grounding jitter:
+  text conditioning is image-grounded and re-jittered every step (see below), and a
+  cached embedding freezes one grounding scale. The 24 GB tier deliberately trades
+  that away — see the VRAM section.
+- **Two references + `cache_text_embeddings: true` also requires
+  `model_kwargs: {multi_ref: true}`.** ai-toolkit's caching path grounds only the
+  *first* control image unless the model reports `has_multiple_control_images`, which
+  only `multi_ref` sets — without it, reference #2 is dropped from the semantic path
+  while still contributing appearance tokens. The trainer raises on this combination
+  at startup. (Uncached two-reference training does not need the flag, but setting it
+  is harmless and makes the intent explicit.)
 - **`flip_x` / `flip_y` must stay false** on edit datasets: ai-toolkit flips the
   target image but not the raw control (reference) images, so every flipped pair is
   silently desynced. The trainer raises on this when it can see the dataset config;
@@ -91,17 +125,22 @@ my_dataset/
   encoder alongside the instruction. Grounding resolution is jittered per step for
   scale robustness. **The released LoRAs trained at max 768 / jitter min 384**, which
   is also what this trainer now uses by default (and matches the inference node's
-  `grounding_px` default of 768) — no env vars needed:
+  `grounding_px` default of 768) — no env vars needed (run from the ai-toolkit root):
   ```bash
-  python run.py config/your_config.yaml
+  python run.py extensions/krea2_edit/configs/krea2_edit_lora_512.yaml
   ```
   The env vars remain as *optional overrides*, e.g. a higher cap (which is **not**
   what the released weights used, and costs VRAM and step time):
   ```bash
-  GROUNDING_MAX_PX=1024 GROUNDING_JITTER_MIN=384 python run.py config/your_config.yaml
+  GROUNDING_MAX_PX=1024 GROUNDING_JITTER_MIN=384 python run.py extensions/krea2_edit/configs/krea2_edit_lora_512.yaml
   ```
   `GROUNDING_MAX_PX=0` disables the cap entirely (native-resolution grounding) — off
   the released recipe; the trainer warns when you do it.
+  **Stale-cache caveat:** ai-toolkit's text-embedding cache key does not include the
+  grounding settings. If you are training with `cache_text_embeddings: true` and you
+  change `GROUNDING_MAX_PX` / `GROUNDING_JITTER_MIN`, delete the `_t_e_cache` folders
+  in your dataset directories first — otherwise the run silently reuses embeddings
+  built at the old grounding resolution.
 - **Fit reference protocol** (`fit` geometry, `model_kwargs: {fit_refs: true}` — the
   default) — references are AR-preserving fitted to the target grid with exact /16
   alignment and fractionally-centered positions. This matches the v1.2.4+ node
@@ -117,6 +156,16 @@ my_dataset/
   stage often beats any single one.
 - Rank: useful capacity saturates well below what you might expect — r64–128 is a
   good default; go higher only if you measure a reason to.
+- **`model_kwargs: {checkpoint_every_n: N}`** — selective gradient checkpointing:
+  with `train.gradient_checkpointing: true`, only every *N*th transformer block is
+  recomputed instead of all of them, buying step time back for VRAM. `1` (the
+  default) checkpoints every block — lowest VRAM, slowest. `2`–`4` is the useful
+  range if you have headroom on the VRAM table below; the trainer prints how many
+  blocks it ended up checkpointing at load.
+- **`train.unload_text_encoder` must stay false.** The text encoder *is* the grounding
+  path here; with it unloaded and nothing cached, ai-toolkit substitutes a blank
+  embedding on every step and the run trains on no conditioning at all. The trainer
+  raises at startup rather than let that happen.
 
 ### Not supported
 
@@ -132,11 +181,23 @@ inference nodes cannot reproduce:
   dimensions; mixed-size datasets crash mid-run. Use `batch_size: 1` and raise
   `gradient_accumulation` instead.
 - **More than 2 references.** The nodes expose exactly two reference inputs
-  (`source_image` + `source_image_b`), so at most two `control_path` entries.
+  (`source_image` + `source_image_b`), so at most two `control_path` entries. Checked
+  at startup from the config, with a runtime backstop.
 - **Flip augmentation with the fit protocol** (`flip_x` / `flip_y` on a dataset).
   ai-toolkit flips the target image but *not* the raw control images, silently
   desyncing every flipped pair. Keep both false, or pre-flip pairs offline (flipping
   target *and* source together, as a separate dataset folder).
+- **Unpaired targets in an edit dataset.** A target with no stem-matched source trains
+  as plain T2I with no warning; the startup audit refuses to start and names the
+  offending files.
+- **Two `control_path` entries + `cache_text_embeddings: true` without
+  `model_kwargs: {multi_ref: true}`** — reference #2 would be dropped from the grounded
+  text path.
+- **`train.unload_text_encoder: true`** — the grounding encode needs the text encoder
+  resident; without it ai-toolkit trains on blank embeddings.
+
+All of these are checked in the model constructor, i.e. before the base weights and
+caches load, so a bad config fails in seconds rather than after a long warm-up.
 
 ## VRAM: measured requirements — read before filing an issue
 
@@ -163,7 +224,11 @@ read 31.3 GB and fell into PCIe offload — matching the table.
   which evicts the 4 GB TE and lands ~24 GB — borderline, and caching freezes ONE
   grounding scale, trading away the scale-robustness the jitter provides. A
   multi-scale grounding cache that removes this tradeoff is planned for a follow-up
-  release.
+  release. Two caveats when you take this tier: two-reference datasets additionally
+  need `model_kwargs: {multi_ref: true}` (otherwise reference #2 never reaches the
+  grounded text path), and the cache key ignores the grounding env vars — delete the
+  dataset `_t_e_cache` folders after changing `GROUNDING_MAX_PX` /
+  `GROUNDING_JITTER_MIN`.
 - **16 GB**: **not supported today.** Please don't file issues asking why 1024
   training OOMs on 16 GB — the base model alone is 13 GB quantized. The planned
   grounding-cache mode plus aggressive settings may eventually enable 512px here.

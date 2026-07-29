@@ -10,9 +10,6 @@ Additive subclass of Krea2Model that turns the T2I model into an editor with
     sequence, distinguished only by RoPE **frame axis = 1** (h,w stay aligned).
 
 The T2I path in ``krea2.py`` is untouched. arch: ``krea2_edit``.
-
-v1 status: the Qwen3-VL image-encode formatting (get_prompt_embeds / _encode_image)
-is the part to validate first — start with the recon sanity run in docs/STAGE0.md.
 """
 import os
 import torch
@@ -195,7 +192,7 @@ class Krea2EditModel(Krea2Model):
         ai-toolkit hands a model class only its ModelConfig — there is no official
         view of train/dataset config from here — but the process instance is a local
         of the calling frame (``BaseSDTrainProcess.load_model`` -> ``ModelClass(...)``),
-        so the guards below can read batch_size and the dataset flip flags. Returns
+        so the guards below can read train_config and the dataset configs. Returns
         None when we are not being constructed by a train process (plain import,
         third-party harness); the guards then no-op and the README restrictions
         apply on the honor system.
@@ -215,48 +212,220 @@ class Krea2EditModel(Krea2Model):
             del frame
         return None
 
+    @staticmethod
+    def _control_paths_of(ds) -> List[str]:
+        """Normalized list of control_path entries declared by a DatasetConfig."""
+        cp = getattr(ds, "control_path", None)
+        if cp is None or cp == "":
+            return []
+        return list(cp) if isinstance(cp, (list, tuple)) else [cp]
+
+    @classmethod
+    def _audit_pairs(cls, ds):
+        """Filename-only audit of one dataset's target/source stem pairing.
+
+        Mirrors ai-toolkit's own resolution exactly (``AiToolkitDataset.__init__``
+        builds the target list with ``os.walk`` + ``image_extensions``, skipping
+        dotfiles and ``_controls/``; ``ControlFileItemDTOMixin.__init__`` then looks
+        for ``<control_dir>/<target stem><ext>`` for ext in ``img_ext_list``), so the
+        counts here are what the dataloader will actually resolve.
+
+        The dataset objects themselves do not exist yet at model-construction time —
+        ``BaseSDTrainProcess.run()`` builds the model (``self.sd = ModelClass(...)``)
+        long before ``get_dataloader_from_datasets`` — so we resolve from the dataset
+        *config* instead. Only directory entries are read; no image or caption file is
+        ever opened.
+
+        Returns ``None`` when the audit does not apply (json-manifest dataset,
+        ``control_from_same_folder``, missing folder), else a dict with the counts.
+        """
+        ctrl_dirs = cls._control_paths_of(ds)
+        if not ctrl_dirs or getattr(ds, "control_from_same_folder", False):
+            return None
+        root = getattr(ds, "dataset_path", None) or getattr(ds, "folder_path", None)
+        if not root or not os.path.isdir(root):
+            return None  # json manifest or a bad path — upstream reports that itself
+        exts = (".jpg", ".jpeg", ".png", ".webp")
+        targets = []
+        for dirpath, _dirs, files in os.walk(root):
+            if os.path.basename(dirpath) == "_controls":
+                continue
+            for fn in files:
+                if fn.lower().endswith(exts) and not fn.startswith("."):
+                    targets.append(fn)
+        missing_all, partial, per_dir = [], [], {d: 0 for d in ctrl_dirs}
+        for fn in targets:
+            stem = os.path.splitext(fn)[0]
+            hits = 0
+            for d in ctrl_dirs:
+                if any(os.path.exists(os.path.join(d, stem + e)) for e in exts):
+                    hits += 1
+                else:
+                    per_dir[d] += 1
+            if hits == 0:
+                missing_all.append(fn)
+            elif hits < len(ctrl_dirs):
+                partial.append(fn)
+        return {
+            "root": root, "ctrl_dirs": ctrl_dirs, "total": len(targets),
+            "missing_all": missing_all, "partial": partial, "per_dir": per_dir,
+        }
+
     def _validate_raw_control_training_config(self):
-        """Hard-fail configs that silently corrupt fit-protocol training."""
-        if not self.use_raw_control_images:
-            return
+        """Hard-fail configs that silently train something the nodes cannot reproduce.
+
+        Runs once, from ``__init__`` — i.e. before the base weights, the text encoder
+        and the latent/text caches are loaded, so a broken config costs seconds rather
+        than a full model load (or, worse, a whole run that only looks healthy).
+        """
         proc = self._find_owning_train_process()
         if proc is None:
-            print("[krea2_edit] NOTE: train config not visible from the model class; the "
-                  "batch_size and flip-augmentation guards were skipped. With the fit "
-                  "protocol you MUST use batch_size: 1 and flip_x/flip_y: false "
-                  "(see README, 'Not supported').")
+            print("[krea2_edit] NOTE: train/dataset config not visible from the model "
+                  "class; the startup guards (batch_size, flip augmentation, "
+                  "source-image pairing, reference count, text-embedding caching, "
+                  "unload_text_encoder) were skipped. See README, 'Not supported'.")
             return
-        batch_size = int(getattr(proc.train_config, "batch_size", 1) or 1)
-        if batch_size > 1:
+        datasets = list(getattr(proc, "dataset_configs", None) or [])
+
+        # --- guards specific to the fit protocol (raw control images) --------------
+        if self.use_raw_control_images:
+            batch_size = int(getattr(proc.train_config, "batch_size", 1) or 1)
+            if batch_size > 1:
+                raise ValueError(
+                    f"krea2_edit: batch_size={batch_size} is not supported with the fit "
+                    "reference protocol (fit_refs: true, the default).\n"
+                    "  ai-toolkit collates raw control images with torch.cat, which requires "
+                    "every source image in a batch to have identical pixel dimensions — a "
+                    "mixed-size dataset crashes mid-run.\n"
+                    "  Use train.batch_size: 1 (raise gradient_accumulation instead), or set "
+                    "model_kwargs.fit_refs: false to fall back to the legacy crop geometry "
+                    "(which then requires fit_mode: 'crop (legacy)' at inference)."
+                )
+            flipped = [
+                getattr(d, "folder_path", "<dataset>")
+                for d in datasets
+                if getattr(d, "flip_x", False) or getattr(d, "flip_y", False)
+            ]
+            if flipped:
+                raise ValueError(
+                    "krea2_edit: flip augmentation (flip_x / flip_y) is not supported with the "
+                    "fit reference protocol (fit_refs: true, the default).\n"
+                    "  ai-toolkit flips the TARGET image but not the raw control (reference) "
+                    "images, so every flipped pair is silently desynced — the LoRA is trained "
+                    "on mirrored supervision.\n"
+                    f"  Offending dataset(s): {flipped}\n"
+                    "  Set flip_x: false / flip_y: false, or pre-flip your pairs offline."
+                )
+
+        # --- guards that apply to both reference protocols --------------------------
+        # The whole arch grounds the instruction on the reference images inside the
+        # text encoder. Unloading the TE makes ai-toolkit fall back to a cached BLANK
+        # embedding for every step (SDTrainer: `if unload_text_encoder or
+        # is_caching_text_embeddings` -> `cached_blank_embeds` when the batch has no
+        # cached embeds), i.e. the model trains with no instruction and no grounding.
+        if getattr(proc.train_config, "unload_text_encoder", False):
             raise ValueError(
-                f"krea2_edit: batch_size={batch_size} is not supported with the fit "
-                "reference protocol (fit_refs: true, the default).\n"
-                "  ai-toolkit collates raw control images with torch.cat, which requires "
-                "every source image in a batch to have identical pixel dimensions — a "
-                "mixed-size dataset crashes mid-run.\n"
-                "  Use train.batch_size: 1 (raise gradient_accumulation instead), or set "
-                "model_kwargs.fit_refs: false to fall back to the legacy crop geometry "
-                "(which then requires fit_mode: 'crop (legacy)' at inference)."
+                "krea2_edit: train.unload_text_encoder: true is not supported.\n"
+                "  This architecture encodes the reference image(s) INSIDE the text "
+                "encoder (the instruction is image-grounded), so the text encoder must "
+                "stay resident. With it unloaded and no cached embeddings, ai-toolkit "
+                "feeds a blank embedding on every step — the run looks healthy and "
+                "trains on no conditioning at all.\n"
+                "  Set train.unload_text_encoder: false. To save the TE's VRAM instead, "
+                "use dataset cache_text_embeddings: true (which freezes one grounding "
+                "scale — see the README VRAM section for the tradeoff)."
             )
-        flipped = [
-            getattr(d, "folder_path", "<dataset>")
-            for d in (getattr(proc, "dataset_configs", None) or [])
-            if getattr(d, "flip_x", False) or getattr(d, "flip_y", False)
-        ]
-        if flipped:
-            raise ValueError(
-                "krea2_edit: flip augmentation (flip_x / flip_y) is not supported with the "
-                "fit reference protocol (fit_refs: true, the default).\n"
-                "  ai-toolkit flips the TARGET image but not the raw control (reference) "
-                "images, so every flipped pair is silently desynced — the LoRA is trained "
-                "on mirrored supervision.\n"
-                f"  Offending dataset(s): {flipped}\n"
-                "  Set flip_x: false / flip_y: false, or pre-flip your pairs offline."
-            )
+
+        for ds in datasets:
+            ctrl_dirs = self._control_paths_of(ds)
+            folder = getattr(ds, "folder_path", None) or getattr(ds, "dataset_path", "<dataset>")
+            if not ctrl_dirs:
+                continue  # targets-only (plain T2I regularization) — legitimate
+
+            # More than two references can never be reproduced at inference. Visible
+            # here from the config; _check_ref_count stays as a runtime backstop for
+            # datasets that assemble references some other way.
+            if len(ctrl_dirs) > MAX_REFS:
+                raise ValueError(
+                    f"krea2_edit: dataset '{folder}' declares {len(ctrl_dirs)} control_path "
+                    f"entries, but the comfyui-krea2edit nodes accept at most {MAX_REFS} "
+                    "references (source_image + source_image_b).\n"
+                    f"  control_path: {ctrl_dirs}\n"
+                    "  A LoRA trained with more reference token blocks cannot be reproduced "
+                    "at inference. Use at most two control_path entries per dataset."
+                )
+
+            # Cached text embeddings ground only ctrl_img_list[0] unless the model
+            # advertises has_multiple_control_images — which only multi_ref sets. So a
+            # two-reference dataset with caching on silently drops reference #2 from
+            # the semantic path (it still gets appearance tokens: half-conditioned).
+            if len(ctrl_dirs) > 1 and getattr(ds, "cache_text_embeddings", False) \
+                    and not self.multi_ref:
+                raise ValueError(
+                    f"krea2_edit: dataset '{folder}' has {len(ctrl_dirs)} control_path entries "
+                    "and cache_text_embeddings: true, but model_kwargs.multi_ref is not set.\n"
+                    "  When ai-toolkit caches text embeddings it grounds only the FIRST "
+                    "control image unless the model reports has_multiple_control_images, "
+                    "which only multi_ref: true sets. Reference #2 would be silently dropped "
+                    "from the semantic (grounded text) path while still contributing "
+                    "appearance tokens — the LoRA learns a conditioning the nodes never "
+                    "reproduce.\n"
+                    "  Fix either way:\n"
+                    "    - model.model_kwargs.multi_ref: true   (grounds every reference), or\n"
+                    "    - dataset cache_text_embeddings: false (the recommended setting: it "
+                    "also keeps the per-step grounding jitter)."
+                )
+
+            # A target with no stem-matched source trains as plain T2I, silently.
+            report = self._audit_pairs(ds)
+            if report is None:
+                continue
+            if report["missing_all"]:
+                n, m = len(report["missing_all"]), report["total"]
+                ex = ", ".join(sorted(report["missing_all"])[:5])
+                more = "" if n <= 5 else f" (+{n - 5} more)"
+                raise ValueError(
+                    f"krea2_edit: {n} of {m} target images in dataset '{report['root']}' have "
+                    "no stem-matched source image.\n"
+                    "  ai-toolkit resolves a control image by filename stem: for target "
+                    "<stem>.<ext> it looks for <control_dir>/<stem>.{jpg,jpeg,png,webp}. When "
+                    "nothing matches, the item loses its control image and trains as PLAIN "
+                    "TEXT-TO-IMAGE — no reference tokens, no image-grounded text encode. The "
+                    "run looks healthy and the LoRA quietly learns the wrong thing.\n"
+                    f"  control_path searched: {report['ctrl_dirs']}\n"
+                    f"  Example unpaired target filenames: {ex}{more}\n"
+                    "  Fix: add the missing source images (stems must match exactly, "
+                    "extensions need not), or move the unpaired targets into a separate "
+                    "targets-only dataset entry with no control_path if you really do want "
+                    "them as T2I regularization."
+                )
+            if report["partial"]:
+                n, m = len(report["partial"]), report["total"]
+                ex = ", ".join(sorted(report["partial"])[:5])
+                more = "" if n <= 5 else f" (+{n - 5} more)"
+                per_dir = ", ".join(f"{d}: {c} missing" for d, c in report["per_dir"].items())
+                bar = "!" * 78
+                print(bar)
+                print(f"[krea2_edit] WARNING: {n} of {m} targets in '{report['root']}' match "
+                      "SOME but not all control_path entries.")
+                print(f"[krea2_edit]   per control_path -> {per_dir}")
+                print(f"[krea2_edit]   examples: {ex}{more}")
+                print("[krea2_edit]   Those items train with fewer references, and reference "
+                      "ORDER shifts: a target")
+                print("[krea2_edit]   matched only by the SECOND control_path gets it as "
+                      "reference #1 (frame 1).")
+                print("[krea2_edit]   Complete the pairs, or split them into their own "
+                      "single-reference dataset entry.")
+                print(bar)
 
     @staticmethod
     def _check_ref_count(n_refs: int):
-        """The nodes take at most two references — refuse to train an unusable LoRA."""
+        """The nodes take at most two references — refuse to train an unusable LoRA.
+
+        Runtime backstop: the config-level control_path count is already checked at
+        construction by _validate_raw_control_training_config, so this only fires for
+        references assembled outside a plain control_path list.
+        """
         if n_refs > MAX_REFS:
             raise ValueError(
                 f"krea2_edit: {n_refs} reference images resolved for a sample, but the "
