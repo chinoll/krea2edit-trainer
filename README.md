@@ -9,11 +9,13 @@ not a reimplementation. Its reference geometry is byte-matched to the
 [comfyui-krea2edit](https://github.com/lbouaraba/comfyui-krea2edit) inference nodes
 (v1.2.4+), so what you train is what the nodes run.
 
-It adds two model architectures to [ai-toolkit](https://github.com/ostris/ai-toolkit):
+It adds one model architecture to [ai-toolkit](https://github.com/ostris/ai-toolkit):
 
-- `krea2` — plain text-to-image LoRA training on Krea 2 RAW
 - `krea2_edit` — instruction-based, reference-conditioned editing (the identity-edit
   recipe): in-context reference tokens + image-grounded text conditioning
+
+(Plain Krea 2 text-to-image training is already built into upstream ai-toolkit as
+`arch: "krea2"` — this extension doesn't duplicate it.)
 
 ## Install
 
@@ -23,13 +25,14 @@ git clone https://github.com/lbouaraba/krea2edit-trainer krea2_edit
 ```
 
 That's it — ai-toolkit discovers extensions in that folder. Set `arch: "krea2_edit"`
-(or `"krea2"`) in your config.
+in your config.
 
 ## Model access
 
 Krea 2 RAW weights are gated: accept the license at
 [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw), then point
-`model.name_or_path` at the checkpoint (single-file or diffusers layout).
+`model.name_or_path` at the single-file `.safetensors` checkpoint (or a folder
+containing one — the sharded diffusers layout is not supported).
 
 ## Dataset layout
 
@@ -100,8 +103,8 @@ read 31.3 GB and fell into PCIe offload — matching the table.
 - **24 GB**: only with **cached text embeddings** (`cache_text_embeddings: true`),
   which evicts the 4 GB TE and lands ~24 GB — borderline, and caching freezes ONE
   grounding scale, trading away the scale-robustness the jitter provides. A
-  multi-scale grounding cache that removes this tradeoff is planned (tracked in
-  issues).
+  multi-scale grounding cache that removes this tradeoff is planned for a follow-up
+  release.
 - **16 GB**: **not supported today.** Please don't file issues asking why 1024
   training OOMs on 16 GB — the base model alone is 13 GB quantized. The planned
   grounding-cache mode plus aggressive settings may eventually enable 512px here.
