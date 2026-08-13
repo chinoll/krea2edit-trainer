@@ -4,7 +4,8 @@ Additive subclass of Krea2Model that turns the T2I model into an editor with
 **dual conditioning** (the Qwen-Image-Edit recipe), reusing Krea's components:
 
   * semantic path  — the source image is fed into the Qwen3-VL text encoder so the
-    instruction is image-grounded (``encode_control_in_text_embeddings``);
+    instruction is image-grounded; image-patch hidden states are removed before
+    the VLM result becomes DiT context (``encode_control_in_text_embeddings``);
   * appearance path — the source latent is patchified and concatenated as a block
     of **clean** tokens before the (noisy) target tokens in the single-stream
     sequence, distinguished only by RoPE **frame axis = 1** (h,w stay aligned).
@@ -748,6 +749,44 @@ class Krea2EditModel(Krea2Model):
                     Image.LANCZOS)
         return pil
 
+    def _text_only_vlm_context(
+        self,
+        hiddens: torch.Tensor,
+        input_ids: torch.Tensor,
+        end: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Remove Qwen3-VL image-patch states before sending context to the DiT.
+
+        Qwen3-VL replaces every ``<|image_pad|>`` position in its input sequence
+        with a visual embedding. The VLM still processes those positions, so the
+        retained instruction and assistant states remain image-grounded through
+        causal attention. Only the visual-patch states are removed from the DiT
+        context. ``<|vision_start|>`` and ``<|vision_end|>`` are language-model
+        delimiter tokens and are intentionally retained.
+
+        ``hiddens`` is one sample with shape ``(S, n_layers, hidden)`` and
+        ``input_ids`` is its matching unpadded token sequence.
+        """
+        if hiddens.shape[0] != input_ids.shape[0]:
+            raise ValueError(
+                "krea2_edit: Qwen3-VL hidden-state and input-id sequence lengths differ; "
+                "cannot safely remove visual tokens."
+            )
+
+        image_token_id = getattr(self.text_encoder.config, "image_token_id", None)
+        if image_token_id is None:
+            image_token_id = self._mm_processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        if image_token_id is None or image_token_id < 0:
+            raise ValueError(
+                "krea2_edit: could not resolve Qwen3-VL's <|image_pad|> token id; "
+                "refusing to pass unfiltered visual states to the DiT."
+            )
+
+        stop = hiddens.shape[0] if end is None else end
+        states = hiddens[PROMPT_TEMPLATE_ENCODE_START_IDX:stop]
+        ids = input_ids[PROMPT_TEMPLATE_ENCODE_START_IDX:stop]
+        return states[ids != image_token_id]
+
     @torch.no_grad()
     def _encode_image_prompt_batch(self, prompts: List[str], images: List[torch.Tensor]) -> List[torch.Tensor]:
         """Batched twin of _encode_image_prompt: one padded forward, per-item valid slice.
@@ -755,7 +794,9 @@ class Krea2EditModel(Krea2Model):
         Right padding keeps the fixed START_IDX system prefix aligned at the front of every
         row (causal attention: real tokens never attend to the pads that follow them), and
         the attention_mask valid-length slice drops the pads from the tapped hidden states.
-        Returns a list of (L_i, n_layers, d) tensors identical to the single-item path.
+        Returns a list of text-only DiT contexts with shape ``(L_i, n_layers, d)``.
+        Qwen3-VL image-patch states are removed after multimodal encoding, while
+        retained language-token states stay image-grounded.
         """
         dev = self.text_encoder.device
         if getattr(self, "_mm_processor", None) is None:
@@ -782,7 +823,9 @@ class Krea2EditModel(Krea2Model):
         feats = []
         for b in range(len(prompts)):
             valid = int(mask[b].sum().item())
-            feats.append(hiddens[b, PROMPT_TEMPLATE_ENCODE_START_IDX:valid])
+            feats.append(self._text_only_vlm_context(
+                hiddens[b, :valid], inputs["input_ids"][b, :valid]
+            ))
         return feats
 
     @torch.no_grad()
@@ -792,7 +835,9 @@ class Krea2EditModel(Krea2Model):
         `image` may be a single (C,H,W) tensor or a LIST of them (multi-ref): each
         reference contributes its own <|vision_start|><|image_pad|><|vision_end|> block
         in the same user turn, in order (scene first, subject refs after) — mirroring
-        the frame-index order of the token blocks in predict_velocity_edit.
+        the frame-index order of the token blocks in predict_velocity_edit. The VLM
+        sees all image tokens, but their hidden states are removed before the result
+        is handed to the DiT; only image-grounded language-token states remain.
         """
         dev = self.text_encoder.device
         # krea2's self.processor is a TEXT tokenizer; load a real multimodal
@@ -814,4 +859,4 @@ class Krea2EditModel(Krea2Model):
         ).to(dev, non_blocking=True)
         states = self.text_encoder(**inputs, output_hidden_states=True)
         hiddens = torch.stack([states.hidden_states[i] for i in SELECT_LAYERS], dim=2)
-        return hiddens[0, PROMPT_TEMPLATE_ENCODE_START_IDX:]
+        return self._text_only_vlm_context(hiddens[0], inputs["input_ids"][0])

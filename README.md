@@ -122,8 +122,10 @@ my_dataset/
 ## The recipe, in short
 
 - **Grounded text encoding** — each reference image is fed to the Qwen3-VL text
-  encoder alongside the instruction. Grounding resolution is jittered per step for
-  scale robustness. **The released LoRAs trained at max 768 / jitter min 384**, which
+  encoder alongside the instruction. Its image-patch hidden states are removed before
+  the resulting context reaches the DiT, so the DiT receives only language-token states
+  that have already been grounded by the VLM. Grounding resolution is jittered per step
+  for scale robustness. **The released LoRAs trained at max 768 / jitter min 384**, which
   is also what this trainer now uses by default (and matches the inference node's
   `grounding_px` default of 768) — no env vars needed (run from the ai-toolkit root):
   ```bash
