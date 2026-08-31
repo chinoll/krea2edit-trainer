@@ -12,7 +12,10 @@ Additive subclass of Krea2Model that turns the T2I model into an editor with
 
 The T2I path in ``krea2.py`` is untouched. arch: ``krea2_edit``.
 """
+import hashlib
+import json
 import os
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 from typing import TYPE_CHECKING, List, Optional, Sequence
@@ -33,6 +36,138 @@ from .src.text_encoder import (
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
+
+
+def _manifest_path_key(path: str) -> str:
+    """Canonical key shared by manifest parsing and ai-toolkit FileItemDTOs."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _manifest_resolve_path(root: Path, value, field: str, line: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"krea2_edit manifest line {line}: '{field}' must be a non-empty path")
+    path = Path(value)
+    path = path if path.is_absolute() else root / path
+    path = path.resolve()
+    if not path.is_file():
+        raise ValueError(f"krea2_edit manifest line {line}: {field} does not exist: {path}")
+    return str(path)
+
+
+def _manifest_caption(record: dict, line: int) -> str:
+    """Read the explicit inline instruction; manifest paths never infer captions."""
+    target = record.get("target")
+    candidates = []
+    if isinstance(target, dict):
+        candidates.extend([target.get("caption"), target.get("prompt")])
+    candidates.extend([record.get("caption"), record.get("prompt")])
+    for caption in candidates:
+        if isinstance(caption, str):
+            return caption
+    raise ValueError(
+        f"krea2_edit manifest line {line}: provide an inline target.caption or target.prompt string"
+    )
+
+
+def prepare_manifest_dataset(dataset_config) -> bool:
+    """Turn one JSONL manifest into ai-toolkit's caption-map input plus ref metadata.
+
+    ai-toolkit natively accepts a JSON mapping from image path to caption.  The
+    extension creates that tiny deterministic cache at runtime and carries reference
+    records on the DatasetConfig/FileItemDTOs; no ai-toolkit source modification is
+    required.
+    """
+    dataset_path = getattr(dataset_config, "dataset_path", None)
+    if not isinstance(dataset_path, str) or not dataset_path.lower().endswith(".jsonl"):
+        return False
+    manifest_path = Path(dataset_path).resolve()
+    if not manifest_path.is_file():
+        raise ValueError(f"krea2_edit manifest does not exist: {manifest_path}")
+
+    entries: dict[str, dict] = {}
+    captions: dict[str, dict] = {}
+    raw = manifest_path.read_bytes()
+    for line_num, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"krea2_edit manifest line {line_num}: invalid JSON") from exc
+        if not isinstance(record, dict):
+            raise ValueError(f"krea2_edit manifest line {line_num}: each row must be an object")
+        sample_id = record.get("id")
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ValueError(f"krea2_edit manifest line {line_num}: missing non-empty sample id")
+        target = record.get("target")
+        target_image = target.get("image") if isinstance(target, dict) else target
+        target_path = _manifest_resolve_path(manifest_path.parent, target_image, "target.image", line_num)
+        key = _manifest_path_key(target_path)
+        if key in entries:
+            raise ValueError(f"krea2_edit manifest line {line_num}: duplicate target image: {target_path}")
+
+        references = record.get("references", [])
+        if not isinstance(references, list):
+            raise ValueError(f"krea2_edit manifest line {line_num}: references must be a list")
+        parsed_refs, seen_frames, seen_ids = [], set(), set()
+        for ref_index, ref in enumerate(references):
+            if not isinstance(ref, dict):
+                raise ValueError(
+                    f"krea2_edit manifest line {line_num}: references[{ref_index}] must be an object"
+                )
+            ref_id = ref.get("id")
+            frame = ref.get("frame")
+            if not isinstance(ref_id, str) or not ref_id:
+                raise ValueError(
+                    f"krea2_edit manifest line {line_num}: references[{ref_index}].id is required"
+                )
+            if not isinstance(frame, int) or frame <= 0:
+                raise ValueError(
+                    f"krea2_edit manifest line {line_num}: references[{ref_index}].frame must be an integer > 0"
+                )
+            if frame in seen_frames or ref_id in seen_ids:
+                raise ValueError(
+                    f"krea2_edit manifest line {line_num}: duplicate reference frame or id"
+                )
+            seen_frames.add(frame)
+            seen_ids.add(ref_id)
+            parsed_refs.append({
+                "id": ref_id,
+                "frame": frame,
+                "image": _manifest_resolve_path(
+                    manifest_path.parent, ref.get("image"), f"references[{ref_index}].image", line_num
+                ),
+            })
+        parsed_refs.sort(key=lambda ref: ref["frame"])
+        entries[key] = {"id": sample_id, "references": parsed_refs}
+        captions[target_path] = {"caption": _manifest_caption(record, line_num)}
+
+    if not entries:
+        raise ValueError(f"krea2_edit manifest has no samples: {manifest_path}")
+    has_references = [bool(entry["references"]) for entry in entries.values()]
+    if any(has_references) and not all(has_references):
+        raise ValueError(
+            "krea2_edit manifest mixes edit samples with reference-free/T2I samples. "
+            "Put them in separate manifests/dataset entries so every batch has one conditioning contract."
+        )
+    cache_dir = manifest_path.parent / ".krea2edit_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"captions-{hashlib.sha256(raw).hexdigest()[:16]}.json"
+    if not cache_path.is_file():
+        cache_path.write_text(json.dumps(captions, ensure_ascii=False), encoding="utf-8")
+
+    dataset_config.dataset_path = str(cache_path)
+    dataset_config.folder_path = None
+    dataset_config.control_path = None
+    dataset_config.krea2edit_manifest_path = str(manifest_path)
+    dataset_config.krea2edit_manifest_entries = entries
+    return True
+
+
+def prepare_manifest_datasets(dataset_configs):
+    count = sum(prepare_manifest_dataset(dataset) for dataset in dataset_configs)
+    if count:
+        print(f"[krea2_edit] manifest-first datasets ENABLED ({count} JSONL manifest(s))")
 
 
 def krea2_edit_ragged_collation(batch):
@@ -73,7 +208,55 @@ def krea2_edit_ragged_collation(batch):
             refs = list(refs) + [ctrl]
         item.control_tensor = None
         item.control_tensor_list = refs
-    return DataLoaderBatchDTO(file_items=list(batch))
+    dto = DataLoaderBatchDTO(file_items=list(batch))
+    # This survives the ai-toolkit DTO boundary and lets the DiT preserve manifest
+    # frame IDs rather than re-numbering references after a missing role.
+    dto.krea2edit_reference_metadata = [
+        list(getattr(item, "krea2edit_reference_metadata", []) or []) for item in batch
+    ]
+    dto.krea2edit_sample_ids = [getattr(item, "krea2edit_sample_id", None) for item in batch]
+    return dto
+
+
+def _attach_manifest_references(dataset):
+    """Attach explicit manifest references to ai-toolkit FileItemDTOs before caching."""
+    entries = getattr(dataset.dataset_config, "krea2edit_manifest_entries", None)
+    if not entries or getattr(dataset, "_krea2edit_manifest_attached", False):
+        return
+    attached = 0
+    for item in dataset.file_list:
+        entry = entries.get(_manifest_path_key(item.path))
+        if entry is None:
+            raise RuntimeError(
+                f"krea2_edit manifest adapter: no metadata for ai-toolkit target {item.path}"
+            )
+        refs = entry["references"]
+        item.control_path = [ref["image"] for ref in refs] or None
+        item.has_control_image = bool(refs)
+        item.full_size_control_images = True
+        item.krea2edit_reference_metadata = refs
+        item.krea2edit_sample_id = entry["id"]
+        attached += 1
+    dataset._krea2edit_manifest_attached = True
+    print(f"[krea2_edit] attached manifest metadata to {attached} target image(s)")
+
+
+def install_manifest_dataset_adapter():
+    """Hook ai-toolkit at runtime; its source tree remains untouched."""
+    import toolkit.data_loader as data_loader
+
+    dataset_class = data_loader.AiToolkitDataset
+    if getattr(dataset_class, "_krea2edit_manifest_adapter", False):
+        return
+    original_setup_epoch = dataset_class.setup_epoch
+
+    def setup_epoch_with_manifest(self, *args, **kwargs):
+        _attach_manifest_references(self)
+        return original_setup_epoch(self, *args, **kwargs)
+
+    dataset_class.setup_epoch = setup_epoch_with_manifest
+    dataset_class._krea2edit_manifest_adapter = True
+    print("[krea2_edit] manifest dataset adapter ENABLED (runtime hook; ai-toolkit unchanged)")
 
 
 def install_ragged_control_collator():
@@ -211,6 +394,7 @@ def predict_velocity_edit(
     t: torch.Tensor,
     context: torch.Tensor,          # (B, Lt, n*d)
     text_mask: torch.Tensor,        # (B, Lt)
+    reference_frames: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     """Sequence: [text | ref_1(frame=1) | ref_2(frame=2) | ... | target(frame=0)].
 
@@ -227,10 +411,14 @@ def predict_velocity_edit(
 
     if not isinstance(source_latents, (list, tuple)):
         source_latents = [source_latents]
+    if reference_frames is None:
+        reference_frames = list(range(1, len(source_latents) + 1))
+    if len(reference_frames) != len(source_latents):
+        raise ValueError("reference frame metadata must match the number of source latents")
     tgt_tok, tgt_pos, tgt_mask = _img_tokens_and_pos(target_latents, patch, frame=0)
     src_toks, src_poss, src_masks, src_len = [], [], [], 0
-    for i, sl in enumerate(source_latents):
-        tok, pos_i, mask_i = _img_tokens_and_pos(sl, patch, frame=i + 1)
+    for frame, sl in zip(reference_frames, source_latents):
+        tok, pos_i, mask_i = _img_tokens_and_pos(sl, patch, frame=frame)
         src_toks.append(tok); src_poss.append(pos_i); src_masks.append(mask_i)
         src_len += tok.shape[1]
 
@@ -264,6 +452,7 @@ def predict_velocity_edit_varlen(
     source_latents: Sequence[Sequence[torch.Tensor]],
     t: torch.Tensor,
     context: Sequence[torch.Tensor],
+    reference_frames: Optional[Sequence[Sequence[int]]] = None,
 ) -> torch.Tensor:
     """Packed FA2/FA4 edit prediction for B>1 samples with ragged references.
 
@@ -278,19 +467,29 @@ def predict_velocity_edit_varlen(
             "ragged edit batch needs one reference list and text context per target sample "
             f"(got refs={len(source_latents)}, context={len(context)}, batch={batch_size})"
         )
+    if reference_frames is None:
+        reference_frames = [list(range(1, len(refs) + 1)) for refs in source_latents]
+    if len(reference_frames) != batch_size:
+        raise ValueError("ragged reference frame metadata must have one list per target sample")
 
     patch = model.config.patch
     layer_count = model.config.txtlayers
     image_tokens, image_positions, ref_token_counts, text_contexts = [], [], [], []
     target_token_lengths = []
-    for sample, (refs, text_features) in enumerate(zip(source_latents, context)):
+    for sample, (refs, frames, text_features) in enumerate(
+        zip(source_latents, reference_frames, context)
+    ):
         if not refs:
             raise ValueError(
                 f"ragged edit sample {sample} has no reference latent; mix edit and T2I "
                 "examples in separate datasets/batches."
             )
+        if len(frames) != len(refs):
+            raise ValueError(
+                f"ragged reference frame metadata for sample {sample} does not match its references"
+            )
         ref_tokens, ref_positions = [], []
-        for frame, ref in enumerate(refs, start=1):
+        for frame, ref in zip(frames, refs):
             if ref.ndim == 3:
                 ref = ref.unsqueeze(0)
             if ref.ndim != 4 or ref.shape[0] != 1:
@@ -356,10 +555,14 @@ class Krea2EditModel(Krea2Model):
         # route the control image to get_prompt_embeds (semantic grounding)
         self.encode_control_in_text_embeddings = True
         self._control_latents = None  # Tensor (single-ref) or List[Tensor] (multi-ref)
+        self._control_reference_frames = None  # ragged List[List[int]] from manifest metadata
         # Every image keeps its own independent 2D grid. The raw reference is never
         # cropped or target-fitted; it is resized by at most half a patch per axis to
         # the nearest VAE/DiT 16px lattice before latent patchification.
         model_kwargs = model_config.model_kwargs or {}
+        process = self._find_owning_train_process()
+        if process is not None:
+            prepare_manifest_datasets(list(getattr(process, "dataset_configs", None) or []))
         self.max_image_pixels = max_image_pixels_settings(model_kwargs)
         # The collator runs before ai-toolkit constructs the dense target batch. Make
         # the model-config value visible to spawned DataLoader workers as well.
@@ -425,6 +628,11 @@ class Krea2EditModel(Krea2Model):
         if cp is None or cp == "":
             return []
         return list(cp) if isinstance(cp, (list, tuple)) else [cp]
+
+    @staticmethod
+    def _has_manifest_references(ds) -> bool:
+        entries = getattr(ds, "krea2edit_manifest_entries", {}).values()
+        return any(entry.get("references") for entry in entries)
 
     @classmethod
     def _audit_pairs(cls, ds):
@@ -500,7 +708,8 @@ class Krea2EditModel(Krea2Model):
                 unbucketed = [
                     getattr(d, "folder_path", "<dataset>")
                     for d in datasets
-                    if self._control_paths_of(d) and not getattr(d, "buckets", False)
+                    if (self._control_paths_of(d) or self._has_manifest_references(d))
+                    and not getattr(d, "buckets", False)
                 ]
                 if unbucketed:
                     raise ValueError(
@@ -713,8 +922,23 @@ class Krea2EditModel(Krea2Model):
                         f"list per target (refs={len(ctrl_list)}, batch={batch_size})."
                     )
 
+                metadata_per_item = getattr(batch, "krea2edit_reference_metadata", None)
+                if metadata_per_item is not None and len(metadata_per_item) != batch_size:
+                    raise ValueError(
+                        "krea2_edit: manifest reference metadata and target batch sizes differ"
+                    )
                 all_lats = []
-                for refs in refs_per_item:
+                all_frames = []
+                for item_index, refs in enumerate(refs_per_item):
+                    metadata = metadata_per_item[item_index] if metadata_per_item is not None else []
+                    if metadata and len(metadata) != len(refs):
+                        raise ValueError(
+                            f"krea2_edit: sample {item_index} has {len(refs)} loaded references but "
+                            f"{len(metadata)} manifest metadata entries"
+                        )
+                    frames = [int(ref["frame"]) for ref in metadata] if metadata else list(
+                        range(1, len(refs) + 1)
+                    )
                     item_lats = []
                     for c in refs:
                         if c.dim() == 3:
@@ -723,7 +947,9 @@ class Krea2EditModel(Krea2Model):
                         c = self._resize_reference_to_grid(c)
                         item_lats.append(self.encode_images(c).to(latents.device, latents.dtype))
                     all_lats.append(item_lats)
+                    all_frames.append(frames)
                 self._control_latents = all_lats
+                self._control_reference_frames = all_frames
                 if not getattr(self, "_edit_path_logged", False):
                     print(f"[krea2_edit] ragged patch-aligned refs: "
                           f"{[[tuple(l.shape[-2:]) for l in item] for item in all_lats]} "
@@ -731,6 +957,7 @@ class Krea2EditModel(Krea2Model):
                     self._edit_path_logged = True
                 return latents.detach()
             if ctrl is not None:
+                self._control_reference_frames = None
                 if ctrl.dim() == 5:  # multi-ref: (B, N, C, H, W) -> list of per-ref latents
                     lats = []
                     for i in range(ctrl.shape[1]):
@@ -744,6 +971,7 @@ class Krea2EditModel(Krea2Model):
                     self._control_latents = self.encode_images(c).to(latents.device, latents.dtype)
             else:
                 self._control_latents = None
+                self._control_reference_frames = None
         if not getattr(self, "_edit_path_logged", False):
             nref = (len(self._control_latents) if isinstance(self._control_latents, list)
                     else (1 if self._control_latents is not None else 0))
@@ -809,7 +1037,7 @@ class Krea2EditModel(Krea2Model):
                 raw_context = list(raw_context)
             contexts = [c.to(self.device_torch, dtype=self.torch_dtype) for c in raw_context]
             return predict_velocity_edit_varlen(
-                m, li, self._control_latents, t, contexts
+                m, li, self._control_latents, t, contexts, self._control_reference_frames
             )
 
         context, text_mask = pad_text_features(
@@ -820,7 +1048,8 @@ class Krea2EditModel(Krea2Model):
         # imposing a FlashAttention dependency on ordinary batch_size: 1 runs.
         if ragged_controls:
             src = [s.to(self.device_torch, self.torch_dtype) for s in self._control_latents[0]]
-            return predict_velocity_edit(m, li, src, t, context, text_mask)
+            frames = self._control_reference_frames[0] if self._control_reference_frames else None
+            return predict_velocity_edit(m, li, src, t, context, text_mask, frames)
         def _fit(s):
             s = s.to(self.device_torch, self.torch_dtype)
             if s.shape[0] != li.shape[0]:

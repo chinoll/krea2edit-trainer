@@ -1,0 +1,2 @@
+{"id":"scene-subject-0001","target":{"image":"../data/targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"scene","frame":1,"image":"../data/references/0001_scene.jpg"},{"id":"subject","frame":2,"image":"../data/references/0001_subject.png"}]}
+{"id":"subject-only-0002","target":{"image":"../data/targets/0002.png","caption":"Change the subject's jacket to red."},"references":[{"id":"subject","frame":2,"image":"../data/references/0002_subject.jpg"}]}

@@ -30,30 +30,20 @@ config:
       #   pretrained_lora_path: "output/krea2_edit_lora/krea2_edit_lora_000002000.safetensors" }
       save: { dtype: float16, save_every: 250, max_step_saves_to_keep: 8 }
       datasets:
-        # Single-reference edit dataset
-        - folder_path: "data/my_dataset/targets"
-          control_path: ["data/my_dataset/sources"]
+        # Manifest-first dataset. One JSONL row owns its target, inline instruction,
+        # and ordered reference metadata (id + stable RoPE frame + image path).
+        - dataset_path: "data/my_dataset/manifest.jsonl"
           num_repeats: 1
-          caption_ext: "txt"
           caption_dropout_rate: 0.0
           resolution: [512]          # measured 28.1 GB at r64 -> 32 GB is the sweet spot
                                      # ([768] measures 30.9 GB: still 32 GB, but tight)
           buckets: true
           cache_latents_to_disk: true
           cache_text_embeddings: false   # keeps the per-step grounding jitter (the
-                                         # recipe default). Only the 24 GB tier sets
-                                         # this true, trading the jitter away — and a
-                                         # every configured reference is grounded.
-        # Multi-reference example (person + scene + object etc.) — delete if unused
-        # - folder_path: "data/my_duo_dataset/targets"
-        #   control_path: ["data/my_duo_dataset/sources", "data/my_duo_dataset/sources_b", "data/my_duo_dataset/sources_c"]
-        #   num_repeats: 1
-        #   caption_ext: "txt"
-        #   caption_dropout_rate: 0.0
-        #   resolution: [512]
-        #   buckets: true
-        #   cache_latents_to_disk: true
-        #   cache_text_embeddings: false
+                                         # recipe default). Cached text embeddings
+                                         # trade grounding jitter for lower VRAM.
+        # The manifest may give every target a different reference count and source
+        # H/W. Do not set control_path for a manifest dataset.
       # batch_size: 2+ supports mixed reference H/W and counts through FA2/FA4 varlen;
       # keep buckets: true (targets in one batch must still share a grid).
       train: { batch_size: 1, steps: 2000, gradient_accumulation: 1, train_unet: true,

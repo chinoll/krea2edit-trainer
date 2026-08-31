@@ -101,32 +101,39 @@ python run.py extensions/krea2_edit/configs/krea2_edit_lora_512.yaml
 Python 3.10+ is required. Krea 2 RAW is gated; accept its license and provide a valid
 Hugging Face token if needed.
 
-## Dataset layout
+## Manifest-first dataset format
 
-ai-toolkit pairs target and reference files by stem:
+The loader's source of truth is a JSONL manifest, not folder names or matching file
+stems. Set `dataset_path` to this `.jsonl` file and do **not** set `control_path`.
+The extension adapts it at runtime through ai-toolkit's public dataset objects; it
+does not require editing ai-toolkit's source tree.
 
-```text
-data/my_dataset/
-├── targets/
-│   ├── 0001.png
-│   └── 0001.txt        # edit instruction, not target-image caption
-├── sources/
-│   └── 0001.jpg
-└── sources_b/          # optional second reference family
-    └── 0001.png
+```jsonl
+{"id":"edit-0001","target":{"image":"targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"scene","frame":1,"image":"refs/0001_scene.jpg"},{"id":"subject","frame":2,"image":"refs/0001_subject.png"}]}
+{"id":"edit-0002","target":{"image":"targets/0002.jpg","caption":"Make the jacket red."},"references":[{"id":"subject","frame":2,"image":"refs/0002_subject.jpg"}]}
 ```
 
-Every `control_path` becomes one ordered reference block. References may have
-different dimensions and a sample may have a different number of matched references,
-subject to available context length and VRAM.
+All paths are relative to the manifest file (absolute paths also work). Each row has:
+
+- `id`: stable sample ID for logs and auditing.
+- `target.image`: target-image path.
+- `target.caption` (or `target.prompt`): inline edit instruction.
+- `references`: ordered by explicit positive integer `frame`; every reference has a
+  stable semantic `id`, `frame`, and `image` path.
+
+Reference frames do not get renumbered when an earlier role is absent: in the second
+example, `subject` remains frame 2. The loader validates duplicate targets, reference
+IDs, frames, paths, malformed JSON, and mixed edit/T2I rows before model weights load.
+The extension writes a deterministic caption-map cache under `.krea2edit_cache/`;
+ai-toolkit then uses its normal image, bucket, latent-cache, and text-cache mechanisms.
+
+See [krea2_edit_manifest.example.jsonl](configs/krea2_edit_manifest.example.jsonl).
 
 ## Minimal configuration
 
 ```yaml
 datasets:
-  - folder_path: data/my_dataset/targets
-    control_path: [data/my_dataset/sources, data/my_dataset/sources_b]
-    caption_ext: txt
+  - dataset_path: data/my_dataset/manifest.jsonl
     resolution: [512]
     buckets: true
     cache_latents_to_disk: true
