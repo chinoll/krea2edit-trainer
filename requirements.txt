@@ -1,0 +1,16 @@
+torch>=2.6
+torchvision
+accelerate>=1.6
+deepspeed>=0.16
+diffusers>=0.35
+transformers>=4.57
+peft>=0.17
+optimum-quanto>=0.2.4
+safetensors
+huggingface-hub
+einops
+Pillow
+PyYAML
+bitsandbytes
+# A100/A800/Ada: install flash-attn separately with --no-build-isolation.
+# H100/H200/Blackwell: install flash-attn-4, or a compatible flash-attn build.

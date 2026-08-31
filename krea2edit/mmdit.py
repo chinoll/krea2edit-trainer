@@ -1,6 +1,6 @@
 """Krea 2 (K2) single-stream MMDiT backbone.
 
-Vendored from the reference ``mmdit.py`` for ai-toolkit. This is a single-stream
+Vendored from the Krea 2 reference ``mmdit.py``. This is a single-stream
 MMDiT: Qwen3-VL text features are fused by a small ``TextFusionTransformer`` and
 then concatenated with the patchified image latent tokens into one sequence that
 flows through ``SingleStreamBlock`` layers. The model predicts the flow-matching
@@ -127,10 +127,10 @@ def flash_attention_varlen(
     that GPU. There is deliberately no padded-SDPA fallback for ragged B>1 inputs.
     """
     if not q.is_cuda:
-        raise RuntimeError("krea2_edit ragged training requires CUDA FlashAttention.")
+        raise RuntimeError("Krea2Edit ragged training requires CUDA FlashAttention.")
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError(
-            "krea2_edit ragged training requires fp16 or bf16 Q/K/V for FlashAttention; "
+            "Krea2Edit ragged training requires fp16 or bf16 Q/K/V for FlashAttention; "
             f"got {q.dtype}."
         )
     major, minor = torch.cuda.get_device_capability(q.device)
@@ -147,7 +147,7 @@ def flash_attention_varlen(
                 return _flash_attention2_varlen(q, k, v, cu_seqlens, max_seqlen)
             except ImportError as exc:
                 raise RuntimeError(
-                    f"krea2_edit ragged training on {arch} needs FlashAttention-4 "
+                    f"Krea2Edit ragged training on {arch} needs FlashAttention-4 "
                     "(`pip install flash-attn-4`) or a compatible FlashAttention-2 build "
                     "(`pip install flash-attn`)."
                 ) from exc
@@ -157,12 +157,12 @@ def flash_attention_varlen(
             return _flash_attention2_varlen(q, k, v, cu_seqlens, max_seqlen)
         except ImportError as exc:
             raise RuntimeError(
-                f"krea2_edit ragged training on {arch} (including A100/A800) needs "
+                f"Krea2Edit ragged training on {arch} (including A100/A800) needs "
                 "FlashAttention-2: `pip install flash-attn`."
             ) from exc
 
     raise RuntimeError(
-        f"krea2_edit ragged training needs FlashAttention varlen, but {arch} is unsupported. "
+        f"Krea2Edit ragged training needs FlashAttention varlen, but {arch} is unsupported. "
         "Use an Ampere (A100/A800), Ada, Hopper, or newer NVIDIA GPU, or batch_size: 1."
     )
 
@@ -587,8 +587,8 @@ class SingleStreamBlock(nn.Module):
         clean = self.mod(clean_vec)
 
         def choose(normal_value: Tensor, clean_value: Tensor) -> Tensor:
-            normal_value = normal_value[sample_ids]
-            clean_value = clean_value[sample_ids]
+            normal_value = normal_value[:, 0, :][sample_ids]
+            clean_value = clean_value[:, 0, :][sample_ids]
             return torch.where(clean_mask[:, None], clean_value, normal_value)
 
         prescale, preshift, pregate, postscale, postshift, postgate = (

@@ -1,10 +1,13 @@
 krea2-edit-trainer
 Copyright 2026 Conrad Locke
 
-This product includes software developed at Krea AI:
-krea2_edit/src/mmdit.py, krea2_edit/src/text_encoder.py, and krea2_edit/src/pipeline.py
-are vendored/adapted from the reference implementation at
+This product includes software developed at Krea AI. The architecture in
+krea2edit/mmdit.py and the conditioning constants in krea2edit/modeling.py are
+vendored/adapted from the reference implementation at
 https://github.com/krea-ai/krea-2 (Apache License 2.0).
+
+The weighted timestep loss table in krea2edit/timesteps.py is adapted from
+https://github.com/ostris/ai-toolkit (MIT License).
 
 Krea 2 RAW model weights are NOT distributed with this software.
 Krea 2 is licensed under the Krea 2 Community License Agreement. For more
