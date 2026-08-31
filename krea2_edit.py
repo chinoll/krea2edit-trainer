@@ -15,7 +15,7 @@ The T2I path in ``krea2.py`` is untouched. arch: ``krea2_edit``.
 import os
 import torch
 import torch.nn.functional as F
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 from einops import rearrange, repeat
 
 from toolkit.config_modules import ModelConfig
@@ -33,6 +33,55 @@ from .src.text_encoder import (
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
+
+
+def krea2_edit_ragged_collation(batch):
+    """Keep raw edit references as a per-sample list during ai-toolkit collation.
+
+    ai-toolkit's stock ``DataLoaderBatchDTO`` concatenates ``control_tensor``. That
+    is correct for ControlNet-like inputs, but it loses the independent geometry
+    contract of this model (and fails outright when two source images have different
+    H/W).  The DTO already has a ragged ``control_tensor_list`` field, so normalize
+    *every* raw edit control into that representation immediately before it builds
+    the batch.  Targets remain normal bucketed tensors.
+
+    This is deliberately a module-level function: PyTorch can pickle it as the
+    DataLoader ``collate_fn`` on spawn platforms, so workers import this extension
+    and run the same conversion.
+    """
+    from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
+
+    # Bucketed ai-toolkit datasets yield a list of FileItemDTOs directly; the
+    # non-bucketed DataLoader passes the same list as its batch.  Do not recurse
+    # into tensors: a control image itself is a Tensor, not a batch item.
+    if not isinstance(batch, (list, tuple)):
+        batch = [batch]
+    for item in batch:
+        ctrl = getattr(item, "control_tensor", None)
+        if ctrl is None:
+            continue
+        refs = getattr(item, "control_tensor_list", None)
+        if refs is None:
+            refs = [ctrl]
+        else:
+            # This should not normally occur (ai-toolkit uses one field or the
+            # other), but preserve both sources if a third-party loader set both.
+            refs = list(refs) + [ctrl]
+        item.control_tensor = None
+        item.control_tensor_list = refs
+    return DataLoaderBatchDTO(file_items=list(batch))
+
+
+def install_ragged_control_collator():
+    """Install the edit-only collator before ai-toolkit constructs its DataLoader."""
+    import toolkit.data_loader as data_loader
+
+    if getattr(data_loader, "_krea2_edit_ragged_controls", False):
+        return
+    data_loader.dto_collation = krea2_edit_ragged_collation
+    data_loader._krea2_edit_ragged_controls = True
+    print("[krea2_edit] ragged raw-control collator ENABLED "
+          "(references stay per-sample; targets stay bucketed)")
 
 
 # Grounding (semantic path) resolution policy. These defaults MATCH the inference
@@ -122,6 +171,95 @@ def predict_velocity_edit(
         ph=patch, pw=patch, h=h // patch, w=w // patch,
     )
     return velocity
+
+
+def predict_velocity_edit_varlen(
+    model: SingleStreamDiT,
+    target_latents: torch.Tensor,
+    source_latents: Sequence[Sequence[torch.Tensor]],
+    t: torch.Tensor,
+    context: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """FA4-packed edit prediction for B>1 samples with ragged references.
+
+    The target remains a normal bucketed ``(B,C,H,W)`` tensor because ai-toolkit's
+    noise scheduler and flow-matching loss are dense.  References are deliberately
+    *not* batched: each sample may have a different number of sources and every
+    source may have its own latent H/W.  Their text contexts are kept unpadded too.
+    """
+    batch_size, channels, height, width = target_latents.shape
+    if len(source_latents) != batch_size or len(context) != batch_size:
+        raise ValueError(
+            "ragged edit batch needs one reference list and text context per target sample "
+            f"(got refs={len(source_latents)}, context={len(context)}, batch={batch_size})"
+        )
+
+    patch = model.config.patch
+    layer_count = model.config.txtlayers
+    image_tokens, image_positions, ref_token_counts, text_contexts = [], [], [], []
+    target_token_lengths = []
+    for sample, (refs, text_features) in enumerate(zip(source_latents, context)):
+        if not refs:
+            raise ValueError(
+                f"ragged edit sample {sample} has no reference latent; mix edit and T2I "
+                "examples in separate datasets/batches."
+            )
+        ref_tokens, ref_positions = [], []
+        for frame, ref in enumerate(refs, start=1):
+            if ref.ndim == 3:
+                ref = ref.unsqueeze(0)
+            if ref.ndim != 4 or ref.shape[0] != 1:
+                raise ValueError(
+                    f"ragged reference {frame} for sample {sample} must be (1,C,H,W), "
+                    f"got {tuple(ref.shape)}"
+                )
+            tokens, positions, _ = _img_tokens_and_pos(ref, patch, frame=frame)
+            ref_tokens.append(tokens.squeeze(0))
+            ref_positions.append(positions.squeeze(0))
+
+        target_tokens, target_positions, _ = _img_tokens_and_pos(
+            target_latents[sample:sample + 1], patch, frame=0
+        )
+        target_tokens = target_tokens.squeeze(0)
+        target_positions = target_positions.squeeze(0)
+        ref_count = sum(tokens.shape[0] for tokens in ref_tokens)
+        image_tokens.append(torch.cat(ref_tokens + [target_tokens], dim=0))
+        image_positions.append(torch.cat(ref_positions + [target_positions], dim=0))
+        ref_token_counts.append(ref_count)
+        target_token_lengths.append(target_tokens.shape[0])
+
+        if text_features.ndim != 2 or text_features.shape[-1] % layer_count:
+            raise ValueError(
+                f"ragged text context for sample {sample} must be (L, n_layers*hidden), "
+                f"got {tuple(text_features.shape)}"
+            )
+        text_contexts.append(text_features.reshape(
+            text_features.shape[0], layer_count, text_features.shape[-1] // layer_count
+        ))
+
+    predictions = model.forward_varlen(
+        image_tokens=image_tokens,
+        context=text_contexts,
+        t=t,
+        image_positions=image_positions,
+        ref_token_counts=ref_token_counts,
+    )
+    expected_tokens = (height // patch) * (width // patch)
+    if any(length != expected_tokens for length in target_token_lengths):
+        # This should be impossible while ai-toolkit buckets targets, but spell out
+        # the boundary rather than silently reinterpreting a ragged target batch.
+        raise ValueError(
+            "ragged target grids are not supported by ai-toolkit's dense loss. "
+            "Enable dataset buckets so every target in this batch has the same H/W."
+        )
+    velocities = [
+        rearrange(
+            pred, "(h w) (c ph pw) -> c (h ph) (w pw)",
+            ph=patch, pw=patch, h=height // patch, w=width // patch,
+        )
+        for pred in predictions
+    ]
+    return torch.stack(velocities, dim=0).to(target_latents.dtype)
 
 
 class Krea2EditModel(Krea2Model):
@@ -268,13 +406,23 @@ class Krea2EditModel(Krea2Model):
         if self.use_raw_control_images:
             batch_size = int(getattr(proc.train_config, "batch_size", 1) or 1)
             if batch_size > 1:
-                raise ValueError(
-                    f"krea2_edit: batch_size={batch_size} is not supported with native "
-                    "independent-reference geometry.\n"
-                    "  ai-toolkit collates raw control images with torch.cat, which requires "
-                    "every source image in a batch to have identical pixel dimensions — a "
-                    "mixed-size dataset crashes mid-run.\n"
-                    "  Use train.batch_size: 1 and raise gradient_accumulation instead."
+                unbucketed = [
+                    getattr(d, "folder_path", "<dataset>")
+                    for d in datasets
+                    if self._control_paths_of(d) and not getattr(d, "buckets", False)
+                ]
+                if unbucketed:
+                    raise ValueError(
+                        "krea2_edit: ragged references support batch_size > 1, but target "
+                        "latents still use ai-toolkit's dense flow-matching loss.\n"
+                        "  Enable buckets: true for every edit dataset so each batch has one "
+                        "target H×W; source/reference H×W may differ freely.\n"
+                        f"  Unbucketed edit dataset(s): {unbucketed}"
+                    )
+                print(
+                    f"[krea2_edit] batch_size={batch_size}: ragged reference mode ENABLED "
+                    "(FlashAttention-4 varlen; target grids must be bucketed)",
+                    flush=True,
                 )
             flipped = [
                 getattr(d, "folder_path", "<dataset>")
@@ -437,19 +585,39 @@ class Krea2EditModel(Krea2Model):
             ctrl = getattr(batch, "control_tensor", None)
             ctrl_list = getattr(batch, "control_tensor_list", None)
             if ctrl is None and ctrl_list:
-                # raw-control path: ragged per-item ref list (batch collates B=1)
-                refs = ctrl_list[0] if isinstance(ctrl_list[0], (list, tuple)) else ctrl_list
-                lats = []
-                for c in refs:
-                    if c.dim() == 3:
-                        c = c.unsqueeze(0)
-                    c = (c * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
-                    c = self._resize_reference_to_grid(c)
-                    lats.append(self.encode_images(c).to(latents.device, latents.dtype))
-                self._control_latents = lats if len(lats) > 1 else lats[0]
+                # Ragged raw-control path: the extension collator turns every
+                # sample into ``[[ref_1, ...], ...]`` before ai-toolkit's stock
+                # DTO can concatenate them.  Each source gets a separate VAE call
+                # because neither its H/W nor its reference count is shared.
+                batch_size = latents.shape[0]
+                if (len(ctrl_list) == batch_size
+                        and all(isinstance(refs, (list, tuple)) for refs in ctrl_list)):
+                    refs_per_item = ctrl_list
+                elif batch_size == 1:
+                    # Backwards-compatible direct call / old ai-toolkit list form.
+                    refs_per_item = [ctrl_list]
+                elif len(ctrl_list) == batch_size and all(torch.is_tensor(ref) for ref in ctrl_list):
+                    refs_per_item = [[ref] for ref in ctrl_list]
+                else:
+                    raise ValueError(
+                        "krea2_edit: malformed ragged control batch; expected one reference "
+                        f"list per target (refs={len(ctrl_list)}, batch={batch_size})."
+                    )
+
+                all_lats = []
+                for refs in refs_per_item:
+                    item_lats = []
+                    for c in refs:
+                        if c.dim() == 3:
+                            c = c.unsqueeze(0)
+                        c = (c * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
+                        c = self._resize_reference_to_grid(c)
+                        item_lats.append(self.encode_images(c).to(latents.device, latents.dtype))
+                    all_lats.append(item_lats)
+                self._control_latents = all_lats
                 if not getattr(self, "_edit_path_logged", False):
-                    print(f"[krea2_edit] patch-aligned refs: "
-                          f"{[tuple(l.shape[-2:]) for l in lats]} "
+                    print(f"[krea2_edit] ragged patch-aligned refs: "
+                          f"{[[tuple(l.shape[-2:]) for l in item] for item in all_lats]} "
                           f"for target {tuple(latents.shape[-2:])}", flush=True)
                     self._edit_path_logged = True
                 return latents.detach()
@@ -483,16 +651,19 @@ class Krea2EditModel(Krea2Model):
             t = t.unsqueeze(0)
         if t.shape[0] != latent_model_input.shape[0]:
             t = t.expand(latent_model_input.shape[0])
-        context, text_mask = pad_text_features(
-            text_embeddings.text_embeds, self.device_torch, self.torch_dtype
-        )
         li = latent_model_input.to(self.device_torch, self.torch_dtype)
+        ragged_controls = (
+            isinstance(self._control_latents, list)
+            and len(self._control_latents) == li.shape[0]
+            and all(isinstance(refs, (list, tuple)) for refs in self._control_latents)
+        )
         # torch.compile the (LoRA-attached) transformer lazily on the first forward: by now the
         # LoRA is applied, so the compiled graph captures it. Cached -> reference-stable, compiled
         # once. Opt-in via KREA2_COMPILE=1 (needs TRITON_PTXAS_PATH=CUDA-13 ptxas for sm_121a);
         # any compile error falls back to eager so the run never dies on it.
         m = self.transformer
-        if os.environ.get("KREA2_COMPILE") == "1" and not getattr(self, "_compiled", False):
+        if (os.environ.get("KREA2_COMPILE") == "1" and not getattr(self, "_compiled", False)
+                and not (ragged_controls and li.shape[0] > 1)):
             # Block-level compile (in-place): compile each transformer block, not the whole 12.9B
             # graph -- whole-model compile spiked ~+58GB and the watchdog killed it at batch>1. Per-
             # block graphs compile in a fraction of the memory and still fuse the RoPE/norm/SwiGLU.
@@ -508,7 +679,39 @@ class Krea2EditModel(Krea2Model):
             self._compiled = True
         # self.transformer.blocks are now compiled in-place (m is self.transformer)
         if self._control_latents is None:
+            context, text_mask = pad_text_features(
+                text_embeddings.text_embeds, self.device_torch, self.torch_dtype
+            )
             return predict_velocity(m, li, t, context, text_mask)
+
+        if ragged_controls and li.shape[0] > 1:
+            raw_context = text_embeddings.text_embeds
+            if torch.is_tensor(raw_context):
+                if raw_context.dim() == 2 and li.shape[0] == 1:
+                    raw_context = [raw_context]
+                elif raw_context.dim() == 3:
+                    raw_context = [raw_context[i] for i in range(raw_context.shape[0])]
+                else:
+                    raise ValueError(
+                        "krea2_edit: packed edit context must be a list of (L,F) tensors "
+                        "or a (B,L,F) tensor."
+                    )
+            else:
+                raw_context = list(raw_context)
+            contexts = [c.to(self.device_torch, dtype=self.torch_dtype) for c in raw_context]
+            return predict_velocity_edit_varlen(
+                m, li, self._control_latents, t, contexts
+            )
+
+        context, text_mask = pad_text_features(
+            text_embeddings.text_embeds, self.device_torch, self.torch_dtype
+        )
+
+        # A single-item ragged DTO can retain the established SDPA path. It avoids
+        # imposing FlashAttention-4 as a dependency on ordinary batch_size: 1 runs.
+        if ragged_controls:
+            src = [s.to(self.device_torch, self.torch_dtype) for s in self._control_latents[0]]
+            return predict_velocity_edit(m, li, src, t, context, text_mask)
         def _fit(s):
             s = s.to(self.device_torch, self.torch_dtype)
             if s.shape[0] != li.shape[0]:

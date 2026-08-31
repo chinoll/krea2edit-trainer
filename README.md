@@ -19,6 +19,12 @@ patch-aligned grid. The paired nodes accept any requested output pixel size and 
 each axis to the nearest 16px grid; VRAM and the trained resolution range, rather than
 a hard geometry limit, are the practical constraints.
 
+For training with `batch_size > 1`, this extension keeps references as ragged
+per-sample lists and uses FlashAttention-4's varlen kernel for the main DiT stream.
+Every sample may have a different number of references and each reference may have a
+different H×W. Targets are intentionally **not** ragged: ai-toolkit's scheduler and
+flow-matching loss require the target images in one batch to share a bucket/grid.
+
 This is intentionally incompatible with the released
 [krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit) LoRAs,
 which used target-fitted/centered reference geometry. Train a new LoRA for this mode.
@@ -45,6 +51,13 @@ If you want LoRAs that pair with the identity-edit inference stack, train with
 ```bash
 cd ai-toolkit/extensions
 git clone https://github.com/chinoll/krea2edit-trainer krea2_edit
+```
+
+For ragged-reference `batch_size > 1` training, also install FlashAttention-4 in the
+same environment (Hopper/Blackwell CUDA GPU required):
+
+```bash
+pip install flash-attn-4
 ```
 
 That's it — ai-toolkit discovers extensions in that folder. Set `arch: "krea2_edit"`
@@ -115,8 +128,10 @@ my_dataset/
   target image but not the raw control (reference) images, so every flipped pair is
   silently desynced. The trainer raises on this when it can see the dataset config;
   pre-flip pairs offline (both images) if you want mirror augmentation.
-- **`batch_size: 1`** — raw control images of mixed sizes cannot be collated (see
-  "Not supported" below). Use `gradient_accumulation` for a larger effective batch.
+- **`batch_size > 1` is supported for ragged references.** Keep `buckets: true` so
+  targets in a batch have one H×W. Reference count and each reference H×W may differ
+  freely. The B>1 path requires FlashAttention-4; batch size 1 keeps the normal PyTorch
+  SDPA path and does not require it.
 
 ## The recipe, in short
 
@@ -157,6 +172,11 @@ my_dataset/
   `t=0` AdaLN modulation; noisy target tokens (and text) receive the sampled flow time.
   The implementation keeps the two modulation vectors as a small batch-concatenated
   pair, while attention still runs across the complete reference/target sequence.
+- **Ragged reference batching** — the extension installs an edit-only ai-toolkit
+  collator which moves raw controls from `control_tensor` to one
+  `control_tensor_list` per sample before the stock `torch.cat` path runs. For B>1,
+  the main DiT packs `[text | refs | target]` for all samples with `cu_seqlens` and
+  calls FlashAttention-4 varlen attention. There are no padded reference/image tokens.
 - **Weighted flow-matching** — `timestep_type: "weighted"`: uniform timestep sampling
   with a per-timestep loss weight table.
 - **Two-stage training works well**: a bulk skill/identity stage at 512, then a short
@@ -185,10 +205,12 @@ inference nodes cannot reproduce:
   renders the inherited plain-T2I pipeline (no reference tokens, no image-grounded
   text encode), so previews would not show what the LoRA actually does. Use
   `train: { disable_sampling: true }` and evaluate checkpoints in ComfyUI.
-- **`batch_size` > 1 with patch-aligned reference grids.** ai-toolkit collates raw control images
-  with `torch.cat`, which requires every source in a batch to have identical pixel
-  dimensions; mixed-size datasets crash mid-run. Use `batch_size: 1` and raise
-  `gradient_accumulation` instead.
+- **Mixed target grids in one batch.** ai-toolkit's flow-matching/noise/loss path is
+  dense `(B,C,H,W)`, so set `buckets: true` for every edit dataset when
+  `batch_size > 1`. This restriction applies to targets only; references are ragged.
+- **B>1 ragged training without FlashAttention-4.** The packed DiT path deliberately
+  has no padded-SDPA fallback. Install `flash-attn-4` on Hopper/Blackwell, or use
+  `batch_size: 1` (regular SDPA).
 - **Reference count is bounded by context length and VRAM.** Every reference adds a
   full VAE token grid and Qwen3-VL vision block. Start with a small number and avoid
   high-resolution references unless you have measured the resulting memory use.

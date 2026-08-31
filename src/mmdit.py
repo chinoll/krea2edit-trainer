@@ -9,8 +9,9 @@ velocity on the image tokens.
 Differences from the reference (all training-driven, numerically equivalent):
   - ``torch.compile`` decorators are dropped (they fight gradient checkpointing,
     LoRA module swapping and variable shapes during training).
-  - Attention uses a plain ``F.scaled_dot_product_attention`` instead of forcing
-    the cuDNN SDPA backend, so it works across dtypes / masks / backward.
+  - Regular attention uses ``F.scaled_dot_product_attention`` instead of forcing
+    the cuDNN SDPA backend, so it works across dtypes / masks / backward. Ragged
+    B>1 edit batches use FlashAttention-4's packed varlen API instead.
   - ``enable_gradient_checkpointing`` / ``disable_gradient_checkpointing`` and a
     per-block ``torch.utils.checkpoint`` wrapper are added (gated on
     ``torch.is_grad_enabled()`` so eval/sampling never pays for it).
@@ -46,6 +47,79 @@ def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
     xq_ = freqs[..., 0] * xq_[..., 0] + freqs[..., 1] * xq_[..., 1]
     xk_ = freqs[..., 0] * xk_[..., 0] + freqs[..., 1] * xk_[..., 1]
     return xq_.reshape(*xq.shape).to(xq.dtype), xk_.reshape(*xk.shape).to(xk.dtype)
+
+
+def ropeapply_packed(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
+    """RoPE for a varlen-packed token stream.
+
+    ``flash_attn_varlen_func`` receives ``(total_tokens, heads, head_dim)``
+    instead of the regular ``(batch, heads, seq, head_dim)`` layout.  The RoPE
+    frequencies are packed in exactly the same token order.
+    """
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+    freqs = freqs[:, None, :, :, :]
+    xq_ = freqs[..., 0] * xq_[..., 0] + freqs[..., 1] * xq_[..., 1]
+    xk_ = freqs[..., 0] * xk_[..., 0] + freqs[..., 1] * xk_[..., 1]
+    return xq_.reshape(*xq.shape).to(xq.dtype), xk_.reshape(*xk.shape).to(xk.dtype)
+
+
+def flash_attention4_varlen(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+) -> Tensor:
+    """FlashAttention-4 unpadded self-attention with one sequence per sample.
+
+    FA4 is intentionally required for the ragged training path.  Falling back to
+    padding + SDPA would defeat the point of variable-length source grids and can
+    turn a single large reference into an O(B * L^2) allocation.  FA4 currently
+    requires a Hopper/Blackwell CUDA GPU and the ``flash-attn-4`` package.
+    """
+    if not q.is_cuda:
+        raise RuntimeError(
+            "krea2_edit ragged training requires CUDA FlashAttention-4; "
+            "the packed attention tensors are on CPU."
+        )
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            "krea2_edit ragged training requires fp16 or bf16 Q/K/V for FlashAttention-4; "
+            f"got {q.dtype}."
+        )
+    try:
+        from flash_attn.cute import flash_attn_varlen_func
+    except ImportError as exc:
+        raise RuntimeError(
+            "krea2_edit ragged training needs FlashAttention-4. Install it with "
+            "`pip install flash-attn-4` (or `flash-attn-4[cu13]` for CUDA 13) on "
+            "a Hopper/Blackwell GPU. batch_size: 1 still uses the normal SDPA path."
+        ) from exc
+
+    cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
+    try:
+        return flash_attn_varlen_func(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=False,
+        )
+    except TypeError as exc:
+        # Early FA4 previews exposed the positional form. Keep this small ABI
+        # compatibility branch without changing the actual attention semantics.
+        try:
+            return flash_attn_varlen_func(
+                q.contiguous(), k.contiguous(), v.contiguous(), cu_seqlens,
+                cu_seqlens, max_seqlen, max_seqlen, causal=False,
+            )
+        except TypeError:
+            raise RuntimeError(
+                "Installed FlashAttention-4 does not expose the expected "
+                "flash_attn_varlen_func API. Upgrade with `pip install -U flash-attn-4`."
+            ) from exc
 
 
 def attention(
@@ -229,6 +303,24 @@ class Attention(torch.nn.Module):
 
         return out
 
+    def forward_varlen(
+        self,
+        qkv: Tensor,
+        freqs: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+    ) -> Tensor:
+        """Packed FA4 attention for ragged batches (no pad tokens, no mask)."""
+        q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
+        q = rearrange(q, "T (H D) -> T H D", H=self.heads)
+        k = rearrange(k, "T (H D) -> T H D", H=self.kvheads)
+        v = rearrange(v, "T (H D) -> T H D", H=self.kvheads)
+        q, k, v = self.qknorm(q, k, v)
+        q, k = ropeapply_packed(q, k, freqs)
+        out = flash_attention4_varlen(q, k, v, cu_seqlens, max_seqlen)
+        out = rearrange(out, "T H D -> T (H D)")
+        return self.wo(out * F.sigmoid(gate))
+
 
 class LastLayer(torch.nn.Module):
     def __init__(self, features: int, patch: int, channels: int):
@@ -242,6 +334,17 @@ class LastLayer(torch.nn.Module):
         x = (1 + scale) * self.norm(x) + shift
         x = self.linear(x)
         return x
+
+    def forward_varlen(self, x: Tensor, tvec: Tensor, sample_ids: Tensor) -> Tensor:
+        """Final projection for selected packed tokens.
+
+        ``tvec`` remains one vector per sample; only the target tokens are sent
+        here, indexed by their originating sample.
+        """
+        scale, shift = self.modulation(tvec)
+        scale, shift = scale[:, 0, :], shift[:, 0, :]
+        x = (1 + scale[sample_ids]) * self.norm(x) + shift[sample_ids]
+        return self.linear(x)
 
 
 class TextFusionBlock(torch.nn.Module):
@@ -418,6 +521,41 @@ class SingleStreamBlock(nn.Module):
 
         return x
 
+    def forward_varlen(
+        self,
+        x: Tensor,
+        normal_vec: Tensor,
+        clean_vec: Tensor,
+        freqs: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+        sample_ids: Tensor,
+        clean_mask: Tensor,
+    ) -> Tensor:
+        """AdaLN-single block on a packed batch of independent sequences.
+
+        The reference-token t=0 treatment is expressed as a boolean packed mask,
+        rather than a common token span.  This matters when every sample has a
+        different text length, number of references, or reference resolution.
+        """
+        normal = self.mod(normal_vec)
+        clean = self.mod(clean_vec)
+
+        def choose(normal_value: Tensor, clean_value: Tensor) -> Tensor:
+            normal_value = normal_value[sample_ids]
+            clean_value = clean_value[sample_ids]
+            return torch.where(clean_mask[:, None], clean_value, normal_value)
+
+        prescale, preshift, pregate, postscale, postshift, postgate = (
+            choose(n, c) for n, c in zip(normal, clean)
+        )
+        pre = (1 + prescale) * self.prenorm(x) + preshift
+        x = x + pregate * self.attn.forward_varlen(
+            pre, freqs, cu_seqlens, max_seqlen
+        )
+        post = (1 + postscale) * self.postnorm(x) + postshift
+        return x + postgate * self.mlp(post)
+
 
 class SingleStreamDiT(nn.Module):
     def __init__(self, config: SingleMMDiTConfig):
@@ -581,3 +719,122 @@ class SingleStreamDiT(nn.Module):
         output = final[:, txtlen : txtlen + imglen, :]
 
         return output
+
+    def forward_varlen(
+        self,
+        image_tokens: list[Tensor],
+        context: list[Tensor],
+        t: Tensor,
+        image_positions: list[Tensor],
+        ref_token_counts: list[int],
+    ) -> list[Tensor]:
+        """Run the DiT over a ragged batch with FlashAttention-4 varlen kernels.
+
+        Each element describes exactly one independent sequence:
+        ``[text_i | ref_1_i | ... | ref_N_i | target_i]``.  Only the main
+        image/text DiT stream is packed; the tiny four-block text-fusion module is
+        evaluated per sample so it never needs padding either.  Returned tensors are
+        target-only patch predictions, one ``(L_target_i, patch_out)`` tensor each.
+        """
+        batch_size = len(image_tokens)
+        if not (
+            batch_size == len(context) == len(image_positions) == len(ref_token_counts)
+        ):
+            raise ValueError("varlen inputs must contain one image/context/position entry per sample")
+        if batch_size == 0:
+            return []
+        if t.ndim != 1 or t.shape[0] != batch_size:
+            raise ValueError(
+                f"varlen timestep must be (B,), got {tuple(t.shape)} for B={batch_size}"
+            )
+
+        sequences: list[Tensor] = []
+        positions: list[Tensor] = []
+        clean_masks: list[Tensor] = []
+        target_masks: list[Tensor] = []
+        sample_ids: list[Tensor] = []
+        lengths: list[int] = []
+
+        for sample, (img, ctx, img_pos, ref_len) in enumerate(
+            zip(image_tokens, context, image_positions, ref_token_counts)
+        ):
+            if img.ndim != 2 or img_pos.ndim != 2 or img_pos.shape[-1] != 3:
+                raise ValueError("varlen image tokens must be (L,C) with positions (L,3)")
+            if img.shape[0] != img_pos.shape[0]:
+                raise ValueError("varlen image token and position counts differ")
+            if not 0 <= ref_len < img.shape[0]:
+                raise ValueError(
+                    f"sample {sample}: ref_token_count must be in [0, {img.shape[0] - 1}], got {ref_len}"
+                )
+            if ctx.ndim != 3:
+                raise ValueError("varlen text context must be (L_text, selected_layers, hidden)")
+
+            # Keeping B=1 here avoids padding variable VLM-language contexts. It is
+            # only four small text blocks; the 48 DiT blocks below use packed FA4.
+            txt = self.txtmlp(self.txtfusion(ctx.unsqueeze(0), mask=None).squeeze(0))
+            img = self.first(img)
+            txt_len, img_len = txt.shape[0], img.shape[0]
+            seq_len = txt_len + img_len
+
+            sequences.append(torch.cat((txt, img), dim=0))
+            positions.append(torch.cat((
+                torch.zeros((txt_len, 3), dtype=img_pos.dtype, device=img_pos.device),
+                img_pos,
+            ), dim=0))
+            clean_masks.append(torch.cat((
+                torch.zeros(txt_len, dtype=torch.bool, device=img.device),
+                torch.ones(ref_len, dtype=torch.bool, device=img.device),
+                torch.zeros(img_len - ref_len, dtype=torch.bool, device=img.device),
+            )))
+            target_masks.append(torch.cat((
+                torch.zeros(txt_len + ref_len, dtype=torch.bool, device=img.device),
+                torch.ones(img_len - ref_len, dtype=torch.bool, device=img.device),
+            )))
+            sample_ids.append(torch.full((seq_len,), sample, dtype=torch.long, device=img.device))
+            lengths.append(seq_len)
+
+        packed = torch.cat(sequences, dim=0)
+        packed_pos = torch.cat(positions, dim=0)
+        packed_clean_mask = torch.cat(clean_masks, dim=0)
+        packed_target_mask = torch.cat(target_masks, dim=0)
+        packed_sample_ids = torch.cat(sample_ids, dim=0)
+        cumulative = [0]
+        for length in lengths:
+            cumulative.append(cumulative[-1] + length)
+        cu_seqlens = torch.tensor(cumulative, dtype=torch.int32, device=packed.device)
+        max_seqlen = max(lengths)
+
+        normal_t = self.tmlp(
+            temb(t, self.config.tdim, device=packed.device, dtype=packed.dtype)
+        )
+        normal_vec = self.tproj(normal_t)
+        clean_t = self.tmlp(
+            temb(torch.zeros_like(t), self.config.tdim, device=packed.device, dtype=packed.dtype)
+        )
+        clean_vec = self.tproj(clean_t)
+        freqs = self.posemb(packed_pos.unsqueeze(0)).squeeze(0)
+
+        for i, block in enumerate(self.blocks):
+            do_ckpt = (
+                self.gradient_checkpointing
+                and torch.is_grad_enabled()
+                and (i % max(1, getattr(self, "checkpoint_every_n", 1)) == 0)
+            )
+            if do_ckpt:
+                def block_forward(tokens, block=block):
+                    return block.forward_varlen(
+                        tokens, normal_vec, clean_vec, freqs, cu_seqlens, max_seqlen,
+                        packed_sample_ids, packed_clean_mask,
+                    )
+                packed = checkpoint(block_forward, packed, use_reentrant=False)
+            else:
+                packed = block.forward_varlen(
+                    packed, normal_vec, clean_vec, freqs, cu_seqlens, max_seqlen,
+                    packed_sample_ids, packed_clean_mask,
+                )
+
+        target_tokens = self.last.forward_varlen(
+            packed[packed_target_mask], normal_t, packed_sample_ids[packed_target_mask]
+        )
+        target_sample_ids = packed_sample_ids[packed_target_mask]
+        return [target_tokens[target_sample_ids == sample] for sample in range(batch_size)]
