@@ -56,7 +56,11 @@ def krea2_edit_ragged_collation(batch):
     # into tensors: a control image itself is a Tensor, not a batch item.
     if not isinstance(batch, (list, tuple)):
         batch = [batch]
+    max_pixels = max_image_pixels_settings({})
     for item in batch:
+        # Apply the limit to the target before DataLoaderBatchDTO stacks it. This
+        # keeps the target, sampled noise and flow-matching loss on one shared grid.
+        _cap_target_pixels_for_collation(item, max_pixels)
         ctrl = getattr(item, "control_tensor", None)
         if ctrl is None:
             continue
@@ -127,6 +131,59 @@ def max_image_pixels_settings(model_kwargs) -> int:
             "(one 16px VAE/DiT pixel grid)"
         )
     return value
+
+
+def _pixel_budget_size(h: int, w: int, max_pixels: int, alignment: int, pixel_area: int):
+    """Return an aspect-preserving, aligned size whose represented area fits a cap."""
+    if max_pixels <= 0:
+        return h, w
+    if h * w * pixel_area > max_pixels:
+        scale = (max_pixels / float(h * w * pixel_area)) ** 0.5
+        h, w = max(1, round(h * scale)), max(1, round(w * scale))
+    aligned_h = max(alignment, ((h + alignment // 2) // alignment) * alignment)
+    aligned_w = max(alignment, ((w + alignment // 2) // alignment) * alignment)
+    if aligned_h * aligned_w * pixel_area > max_pixels:
+        scale = (max_pixels / float(aligned_h * aligned_w * pixel_area)) ** 0.5
+        aligned_h = max(alignment, int(aligned_h * scale) // alignment * alignment)
+        aligned_w = max(alignment, int(aligned_w * scale) // alignment * alignment)
+    return aligned_h, aligned_w
+
+
+def _resize_spatial_to_pixel_budget(
+    value: torch.Tensor,
+    max_pixels: int,
+    *,
+    alignment: int,
+    pixel_area: int,
+) -> torch.Tensor:
+    """Resize a CHW/BCHW target tensor before ai-toolkit batches it."""
+    if not torch.is_tensor(value) or value.ndim not in (3, 4):
+        return value
+    h, w = value.shape[-2:]
+    new_h, new_w = _pixel_budget_size(h, w, max_pixels, alignment, pixel_area)
+    if (new_h, new_w) == (h, w):
+        return value
+    batched = value.unsqueeze(0) if value.ndim == 3 else value
+    result = F.interpolate(batched, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    return result.squeeze(0) if value.ndim == 3 else result
+
+
+def _cap_target_pixels_for_collation(item, max_pixels: int):
+    """Apply the per-image limit before dense target tensors/latents are stacked.
+
+    Raw targets use a 16px pixel lattice. Cached VAE latents use a 2-cell latent
+    lattice, with each latent cell representing 8×8 source pixels.
+    """
+    tensor = getattr(item, "tensor", None)
+    if torch.is_tensor(tensor):
+        item.tensor = _resize_spatial_to_pixel_budget(
+            tensor, max_pixels, alignment=16, pixel_area=1
+        )
+    latents = getattr(item, "latents", None)
+    if torch.is_tensor(latents):
+        item.latents = _resize_spatial_to_pixel_budget(
+            latents, max_pixels, alignment=2, pixel_area=64
+        )
 
 
 def _img_tokens_and_pos(latent: torch.Tensor, patch: int, frame: int):
@@ -304,6 +361,9 @@ class Krea2EditModel(Krea2Model):
         # the nearest VAE/DiT 16px lattice before latent patchification.
         model_kwargs = model_config.model_kwargs or {}
         self.max_image_pixels = max_image_pixels_settings(model_kwargs)
+        # The collator runs before ai-toolkit constructs the dense target batch. Make
+        # the model-config value visible to spawned DataLoader workers as well.
+        os.environ["KREA2_EDIT_MAX_IMAGE_PIXELS"] = str(self.max_image_pixels)
         self.use_raw_control_images = True
         if "fit_refs" in model_kwargs:
             print("[krea2_edit] NOTE: model_kwargs.fit_refs is obsolete and ignored; "

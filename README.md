@@ -69,16 +69,17 @@ FlashAttention package.
 
 ## Per-image pixel budget
 
-Every raw image entering the edit-conditioning branch is limited independently by
-`model_kwargs.max_image_pixels`
+Every training image is limited independently by `model_kwargs.max_image_pixels`
 (default: `1048576`, i.e. 1 MP). If `H × W` exceeds the limit, it is downscaled by
 `sqrt(limit / (H × W))`, preserving aspect ratio, and then aligned to the 16px
 VAE/DiT grid. The final alignment rounds down when needed, so the pixel limit remains
 a real ceiling. Set `0` to disable the cap.
 
-The limit is applied before both VAE encoding and Qwen3-VL grounding during training.
-ComfyUI inference deliberately keeps its existing arbitrary-size, 16px-aligned input
-behavior and does not expose this training-only cap.
+For target images, the extension scales the raw target tensor (or a cached target
+latent, using its equivalent pixel area) during collation, before noise and loss are
+formed. Conditioning images use the same cap before both VAE encoding and Qwen3-VL
+grounding. ComfyUI inference deliberately keeps its existing arbitrary-size,
+16px-aligned input behavior and does not expose this training-only cap.
 
 ## Install
 
@@ -146,8 +147,8 @@ model:
 ```
 
 `buckets: true` is required for ragged B>1 edit batches. It aligns **target** H×W
-within each batch; it does not resize conditioning images to targets. Configure the
-dataset resolution/buckets separately to bound target-image pixels.
+within each batch; the same per-image cap is applied to every target before the batch
+is stacked. It does not resize conditioning images to target geometry.
 
 ## Important constraints
 
