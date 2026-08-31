@@ -35,11 +35,6 @@ if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 
 
-# The comfyui-krea2edit inference nodes expose exactly two reference inputs
-# (source_image + source_image_b). A LoRA trained with more references cannot be
-# reproduced at inference, so training refuses to produce one.
-MAX_REFS = 2
-
 # Grounding (semantic path) resolution policy. These defaults MATCH the inference
 # node: comfyui-krea2edit's Krea2EditTextEncode defaults `grounding_px` to 768, and
 # the released krea2-identity-edit LoRAs trained with per-step jitter down to 384.
@@ -98,14 +93,6 @@ def predict_velocity_edit(
 
     if not isinstance(source_latents, (list, tuple)):
         source_latents = [source_latents]
-    if len(source_latents) > MAX_REFS:
-        raise ValueError(
-            f"krea2_edit: {len(source_latents)} reference latents in the token sequence, "
-            f"but the comfyui-krea2edit nodes accept at most {MAX_REFS} references "
-            "(source_image + source_image_b). Training with more would produce a LoRA "
-            "the inference nodes cannot reproduce."
-        )
-
     tgt_tok, tgt_pos, tgt_mask = _img_tokens_and_pos(target_latents, patch, frame=0)
     src_toks, src_poss, src_masks, src_len = [], [], [], 0
     for i, sl in enumerate(source_latents):
@@ -163,13 +150,14 @@ class Krea2EditModel(Krea2Model):
         if _g_max <= 0:
             print("[krea2_edit] WARNING: grounding cap disabled -> the VLM sees native-resolution "
                   "references, which is NOT the released recipe (node default grounding_px=768).")
-        # multi_ref: true (model_kwargs) -> OpenSubject-style [scene, subject] dual conditioning.
-        # Dataloader delivers stacked controls (B, N, C, H, W); each ref becomes its own
-        # frame-indexed token block + its own vision block in the Qwen3-VL grounding.
-        self.multi_ref = bool(model_kwargs.get("multi_ref", False))
-        if self.multi_ref:
-            self.has_multiple_control_images = True
-            print("[krea2_edit] multi_ref ENABLED: N-control conditioning (frames 1..N)")
+        # ai-toolkit consults this flag in its cached-text path. Always advertise
+        # multi-reference support so every configured control image reaches Qwen3-VL,
+        # not just the first one. The appearance path already handles an arbitrary N.
+        self.has_multiple_control_images = True
+        if "multi_ref" in model_kwargs:
+            print("[krea2_edit] NOTE: model_kwargs.multi_ref is obsolete; arbitrary "
+                  "reference counts are enabled by default.")
+        print("[krea2_edit] multi-reference conditioning ENABLED (frames 1..N)")
         self._validate_raw_control_training_config()
 
     # ------------------------------------------------------------------
@@ -330,40 +318,6 @@ class Krea2EditModel(Krea2Model):
             if not ctrl_dirs:
                 continue  # targets-only (plain T2I regularization) — legitimate
 
-            # More than two references can never be reproduced at inference. Visible
-            # here from the config; _check_ref_count stays as a runtime backstop for
-            # datasets that assemble references some other way.
-            if len(ctrl_dirs) > MAX_REFS:
-                raise ValueError(
-                    f"krea2_edit: dataset '{folder}' declares {len(ctrl_dirs)} control_path "
-                    f"entries, but the comfyui-krea2edit nodes accept at most {MAX_REFS} "
-                    "references (source_image + source_image_b).\n"
-                    f"  control_path: {ctrl_dirs}\n"
-                    "  A LoRA trained with more reference token blocks cannot be reproduced "
-                    "at inference. Use at most two control_path entries per dataset."
-                )
-
-            # Cached text embeddings ground only ctrl_img_list[0] unless the model
-            # advertises has_multiple_control_images — which only multi_ref sets. So a
-            # two-reference dataset with caching on silently drops reference #2 from
-            # the semantic path (it still gets appearance tokens: half-conditioned).
-            if len(ctrl_dirs) > 1 and getattr(ds, "cache_text_embeddings", False) \
-                    and not self.multi_ref:
-                raise ValueError(
-                    f"krea2_edit: dataset '{folder}' has {len(ctrl_dirs)} control_path entries "
-                    "and cache_text_embeddings: true, but model_kwargs.multi_ref is not set.\n"
-                    "  When ai-toolkit caches text embeddings it grounds only the FIRST "
-                    "control image unless the model reports has_multiple_control_images, "
-                    "which only multi_ref: true sets. Reference #2 would be silently dropped "
-                    "from the semantic (grounded text) path while still contributing "
-                    "appearance tokens — the LoRA learns a conditioning the nodes never "
-                    "reproduce.\n"
-                    "  Fix either way:\n"
-                    "    - model.model_kwargs.multi_ref: true   (grounds every reference), or\n"
-                    "    - dataset cache_text_embeddings: false (the recommended setting: it "
-                    "also keeps the per-step grounding jitter)."
-                )
-
             # A target with no stem-matched source trains as plain T2I, silently.
             report = self._audit_pairs(ds)
             if report is None:
@@ -405,24 +359,6 @@ class Krea2EditModel(Krea2Model):
                 print("[krea2_edit]   Complete the pairs, or split them into their own "
                       "single-reference dataset entry.")
                 print(bar)
-
-    @staticmethod
-    def _check_ref_count(n_refs: int):
-        """The nodes take at most two references — refuse to train an unusable LoRA.
-
-        Runtime backstop: the config-level control_path count is already checked at
-        construction by _validate_raw_control_training_config, so this only fires for
-        references assembled outside a plain control_path list.
-        """
-        if n_refs > MAX_REFS:
-            raise ValueError(
-                f"krea2_edit: {n_refs} reference images resolved for a sample, but the "
-                f"comfyui-krea2edit nodes accept at most {MAX_REFS} references "
-                "(source_image + source_image_b).\n"
-                "  A LoRA trained with more reference token blocks cannot be reproduced "
-                "at inference.\n"
-                "  Use at most two control_path entries per dataset."
-            )
 
     def load_model(self):
         super().load_model()
@@ -502,7 +438,6 @@ class Krea2EditModel(Krea2Model):
             if ctrl is None and ctrl_list:
                 # raw-control path: ragged per-item ref list (batch collates B=1)
                 refs = ctrl_list[0] if isinstance(ctrl_list[0], (list, tuple)) else ctrl_list
-                self._check_ref_count(len(refs))
                 lats = []
                 for c in refs:
                     if c.dim() == 3:
@@ -519,7 +454,6 @@ class Krea2EditModel(Krea2Model):
                 return latents.detach()
             if ctrl is not None:
                 if ctrl.dim() == 5:  # multi-ref: (B, N, C, H, W) -> list of per-ref latents
-                    self._check_ref_count(ctrl.shape[1])
                     lats = []
                     for i in range(ctrl.shape[1]):
                         c_i = (ctrl[:, i] * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)

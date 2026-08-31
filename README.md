@@ -77,12 +77,12 @@ my_dataset/
     0001.txt
   sources/          # reference images, stem-matched to targets
     0001.png
-  sources_b/        # optional second reference (multi-ref), stem-matched
+  sources_b/        # optional additional reference, stem-matched
     0001.png
 ```
 
-- `folder_path` → `targets/`, `control_path` → `["sources/"]` (add `sources_b/` for
-  two-reference training; references appear in the token sequence in list order).
+- `folder_path` → `targets/`, `control_path` → `["sources/"]`. Add as many additional
+  source folders as needed; every entry becomes a reference block in list order.
 - **Every target needs a stem-matched source.** ai-toolkit pairs by filename stem
   only: for `targets/0001.png` it looks for `sources/0001.{jpg,jpeg,png,webp}`.
   Extensions may differ, stems may not. A target with no match keeps its caption,
@@ -101,13 +101,10 @@ my_dataset/
   text conditioning is image-grounded and re-jittered every step (see below), and a
   cached embedding freezes one grounding scale. The 24 GB tier deliberately trades
   that away — see the VRAM section.
-- **Two references + `cache_text_embeddings: true` also requires
-  `model_kwargs: {multi_ref: true}`.** ai-toolkit's caching path grounds only the
-  *first* control image unless the model reports `has_multiple_control_images`, which
-  only `multi_ref` sets — without it, reference #2 is dropped from the semantic path
-  while still contributing appearance tokens. The trainer raises on this combination
-  at startup. (Uncached two-reference training does not need the flag, but setting it
-  is harmless and makes the intent explicit.)
+- **Any number of references is supported.** Each `control_path` entry becomes a
+  clean VAE token block and a Qwen3-VL vision block in the same order. The trainer
+  always advertises multi-image support to ai-toolkit's cached-text path, so semantic
+  grounding includes every configured reference without `model_kwargs.multi_ref`.
 - **`flip_x` / `flip_y` must stay false** on edit datasets: ai-toolkit flips the
   target image but not the raw control (reference) images, so every flipped pair is
   silently desynced. The trainer raises on this when it can see the dataset config;
@@ -183,9 +180,9 @@ inference nodes cannot reproduce:
   with `torch.cat`, which requires every source in a batch to have identical pixel
   dimensions; mixed-size datasets crash mid-run. Use `batch_size: 1` and raise
   `gradient_accumulation` instead.
-- **More than 2 references.** The nodes expose exactly two reference inputs
-  (`source_image` + `source_image_b`), so at most two `control_path` entries. Checked
-  at startup from the config, with a runtime backstop.
+- **Reference count is bounded by context length and VRAM.** Every reference adds a
+  full VAE token grid and Qwen3-VL vision block. Start with a small number and avoid
+  high-resolution references unless you have measured the resulting memory use.
 - **Flip augmentation with native reference grids** (`flip_x` / `flip_y` on a dataset).
   ai-toolkit flips the target image but *not* the raw control images, silently
   desyncing every flipped pair. Keep both false, or pre-flip pairs offline (flipping
@@ -193,9 +190,6 @@ inference nodes cannot reproduce:
 - **Unpaired targets in an edit dataset.** A target with no stem-matched source trains
   as plain T2I with no warning; the startup audit refuses to start and names the
   offending files.
-- **Two `control_path` entries + `cache_text_embeddings: true` without
-  `model_kwargs: {multi_ref: true}`** — reference #2 would be dropped from the grounded
-  text path.
 - **`train.unload_text_encoder: true`** — the grounding encode needs the text encoder
   resident; without it ai-toolkit trains on blank embeddings.
 
@@ -227,11 +221,8 @@ read 31.3 GB and fell into PCIe offload — matching the table.
   which evicts the 4 GB TE and lands ~24 GB — borderline, and caching freezes ONE
   grounding scale, trading away the scale-robustness the jitter provides. A
   multi-scale grounding cache that removes this tradeoff is planned for a follow-up
-  release. Two caveats when you take this tier: two-reference datasets additionally
-  need `model_kwargs: {multi_ref: true}` (otherwise reference #2 never reaches the
-  grounded text path), and the cache key ignores the grounding env vars — delete the
-  dataset `_t_e_cache` folders after changing `GROUNDING_MAX_PX` /
-  `GROUNDING_JITTER_MIN`.
+  release. The cache key ignores the grounding env vars — delete the dataset
+  `_t_e_cache` folders after changing `GROUNDING_MAX_PX` / `GROUNDING_JITTER_MIN`.
 - **16 GB**: **not supported today.** Please don't file issues asking why 1024
   training OOMs on 16 GB — the base model alone is 13 GB quantized. The planned
   grounding-cache mode plus aggressive settings may eventually enable 512px here.

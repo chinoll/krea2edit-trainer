@@ -43,10 +43,10 @@ config:
           cache_text_embeddings: false   # keeps the per-step grounding jitter (the
                                          # recipe default). Only the 24 GB tier sets
                                          # this true, trading the jitter away — and a
-                                         # 2-ref dataset then also needs multi_ref.
-        # Two-reference example (person-into-scene etc.) — delete if unused
+                                         # every configured reference is grounded.
+        # Multi-reference example (person + scene + object etc.) — delete if unused
         # - folder_path: "data/my_duo_dataset/targets"
-        #   control_path: ["data/my_duo_dataset/sources", "data/my_duo_dataset/sources_b"]
+        #   control_path: ["data/my_duo_dataset/sources", "data/my_duo_dataset/sources_b", "data/my_duo_dataset/sources_c"]
         #   num_repeats: 1
         #   caption_ext: "txt"
         #   caption_dropout_rate: 0.0

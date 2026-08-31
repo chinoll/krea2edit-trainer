@@ -12,8 +12,8 @@ geometry will misregister at inference (blur, off-center ghosting, seam artifact
 [ text tokens | ref_1 tokens | ... | ref_N tokens | target tokens ]
 ```
 
-- `N ≤ 2`: the inference nodes expose exactly two reference inputs (`source_image`,
-  `source_image_b`), so the trainer refuses more than two references.
+- `N ≥ 1`, constrained only by the model context length and available VRAM. The paired
+  nodes accept an ordered IMAGE/LATENT batch of additional references.
 - The transformer input is one joint sequence. References are clean (un-noised) VAE
   latents; only target tokens receive flow-matching noise, and **only target tokens
   contribute to the loss** (the predicted-flow slice for refs is discarded).
