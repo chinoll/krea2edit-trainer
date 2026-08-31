@@ -82,8 +82,6 @@ def predict_velocity_edit(
     t: torch.Tensor,
     context: torch.Tensor,          # (B, Lt, n*d)
     text_mask: torch.Tensor,        # (B, Lt)
-    fit_offsets: bool = False,      # fit protocol: refs resampled to target density get
-                                    # centered integer position offsets in the target grid
 ) -> torch.Tensor:
     """Sequence: [text | ref_1(frame=1) | ref_2(frame=2) | ... | target(frame=0)].
 
@@ -112,13 +110,6 @@ def predict_velocity_edit(
     src_toks, src_poss, src_masks, src_len = [], [], [], 0
     for i, sl in enumerate(source_latents):
         tok, pos_i, mask_i = _img_tokens_and_pos(sl, patch, frame=i + 1)
-        if fit_offsets:
-            gh, gw = sl.shape[-2] // patch, sl.shape[-1] // patch
-            # fractional center (2026-07-28): integer floor placed odd-gap refs
-            # half a token (8px) off their true center; RoPE positions are
-            # continuous floats, so the exact center is representable.
-            pos_i[..., 1] += max(0.0, (h // patch - gh) / 2)
-            pos_i[..., 2] += max(0.0, (w // patch - gw) / 2)
         src_toks.append(tok); src_poss.append(pos_i); src_masks.append(mask_i)
         src_len += tok.shape[1]
 
@@ -155,27 +146,16 @@ class Krea2EditModel(Krea2Model):
         # route the control image to get_prompt_embeds (semantic grounding)
         self.encode_control_in_text_embeddings = True
         self._control_latents = None  # Tensor (single-ref) or List[Tensor] (multi-ref)
-        # FIT protocol (s1e, 2026-07-14): refs resampled to target grid density
-        # (AR-preserving fit-inside, no crop, no pad tokens), placed at centered
-        # fractional offsets — matches the node's `fit` inference mode, which is
-        # also the node's DEFAULT. Default ON here so a stock clone reproduces the
-        # released recipe; `model_kwargs: {fit_refs: false}` is an explicit opt-in
-        # to the legacy v1/v1.1 crop geometry.
-        self.fit_refs = bool((model_config.model_kwargs or {}).get("fit_refs", True))
-        self.use_raw_control_images = self.fit_refs
-        if self.fit_refs:
-            print("[krea2_edit] FIT refs ENABLED (target-density resample, centered offsets) "
-                  "— matches node fit_mode: 'fit' (the node default)")
-        else:
-            bar = "!" * 78
-            print(bar)
-            print("[krea2_edit] WARNING: fit_refs=false -> LEGACY v1/v1.1 CROP reference geometry.")
-            print("[krea2_edit]   References are center-cropped to the target aspect ratio before")
-            print("[krea2_edit]   resize. A LoRA trained this way ONLY reproduces at inference with")
-            print("[krea2_edit]   fit_mode: 'crop (legacy)' in the comfyui-krea2edit node — the node")
-            print("[krea2_edit]   defaults to 'fit' and will misregister this LoRA otherwise.")
-            print("[krea2_edit]   The released krea2-identity-edit LoRAs used fit_refs: true.")
-            print(bar)
+        # Every image keeps its own native 2D grid.  The raw reference is neither
+        # cropped nor resized to the target; the frame axis makes its RoPE grid an
+        # independent coordinate system.  It is padded only to the VAE/DiT 16 px
+        # patch lattice, after which its latent is patchified normally.
+        model_kwargs = model_config.model_kwargs or {}
+        self.use_raw_control_images = True
+        if "fit_refs" in model_kwargs:
+            print("[krea2_edit] NOTE: model_kwargs.fit_refs is obsolete and ignored; "
+                  "references now always use independent native grids (no crop).")
+        print("[krea2_edit] NATIVE-GRID refs ENABLED (independent RoPE grids; no crop/resize)")
         # Grounding policy, printed once so every run is self-documenting.
         _g_max, _g_jit = grounding_settings()
         print(f"[krea2_edit] grounding: GROUNDING_MAX_PX={_g_max} GROUNDING_JITTER_MIN={_g_jit} "
@@ -186,7 +166,7 @@ class Krea2EditModel(Krea2Model):
         # multi_ref: true (model_kwargs) -> OpenSubject-style [scene, subject] dual conditioning.
         # Dataloader delivers stacked controls (B, N, C, H, W); each ref becomes its own
         # frame-indexed token block + its own vision block in the Qwen3-VL grounding.
-        self.multi_ref = bool(self.model_config.model_kwargs.get("multi_ref", False))
+        self.multi_ref = bool(model_kwargs.get("multi_ref", False))
         if self.multi_ref:
             self.has_multiple_control_images = True
             print("[krea2_edit] multi_ref ENABLED: N-control conditioning (frames 1..N)")
@@ -297,19 +277,17 @@ class Krea2EditModel(Krea2Model):
             return
         datasets = list(getattr(proc, "dataset_configs", None) or [])
 
-        # --- guards specific to the fit protocol (raw control images) --------------
+        # --- guards for native-size raw control images ------------------------------
         if self.use_raw_control_images:
             batch_size = int(getattr(proc.train_config, "batch_size", 1) or 1)
             if batch_size > 1:
                 raise ValueError(
-                    f"krea2_edit: batch_size={batch_size} is not supported with the fit "
-                    "reference protocol (fit_refs: true, the default).\n"
+                    f"krea2_edit: batch_size={batch_size} is not supported with native "
+                    "independent-reference geometry.\n"
                     "  ai-toolkit collates raw control images with torch.cat, which requires "
                     "every source image in a batch to have identical pixel dimensions — a "
                     "mixed-size dataset crashes mid-run.\n"
-                    "  Use train.batch_size: 1 (raise gradient_accumulation instead), or set "
-                    "model_kwargs.fit_refs: false to fall back to the legacy crop geometry "
-                    "(which then requires fit_mode: 'crop (legacy)' at inference)."
+                    "  Use train.batch_size: 1 and raise gradient_accumulation instead."
                 )
             flipped = [
                 getattr(d, "folder_path", "<dataset>")
@@ -319,7 +297,7 @@ class Krea2EditModel(Krea2Model):
             if flipped:
                 raise ValueError(
                     "krea2_edit: flip augmentation (flip_x / flip_y) is not supported with the "
-                    "fit reference protocol (fit_refs: true, the default).\n"
+                    "native independent-reference geometry.\n"
                     "  ai-toolkit flips the TARGET image but not the raw control (reference) "
                     "images, so every flipped pair is silently desynced — the LoRA is trained "
                     "on mirrored supervision.\n"
@@ -327,7 +305,7 @@ class Krea2EditModel(Krea2Model):
                     "  Set flip_x: false / flip_y: false, or pre-flip your pairs offline."
                 )
 
-        # --- guards that apply to both reference protocols --------------------------
+        # --- guards that apply to all edit batches ----------------------------------
         # The whole arch grounds the instruction on the reference images inside the
         # text encoder. Unloading the TE makes ai-toolkit fall back to a cached BLANK
         # embedding for every step (SDTrainer: `if unload_text_encoder or
@@ -504,60 +482,17 @@ class Krea2EditModel(Krea2Model):
 
     # --- appearance path: stash the source latent for the prediction step ---
     @staticmethod
-    def _fit_ref(x, th, tw):
-        """LEGACY (fit_refs: false) crop geometry: center-crop to the target aspect
-        ratio, then resize. Mirrors the node's fit_mode: 'crop (legacy)'.
+    def _pad_reference_to_grid(c):
+        """Pad (never crop or resize) a reference for VAE / DiT patch alignment.
 
-        Direct interpolate (pre-2026-07-07) STRETCHED mixed-AR refs and taught an
-        inverse-squash prior on faces (v1 post-release finding); that known-bad path
-        is gone — center crop is the only legacy behavior the nodes reproduce."""
-        sh, sw = x.shape[2], x.shape[3]
-        if sh == th and sw == tw:
-            return x
-        tar, sar = tw / th, sw / sh
-        if abs(sar - tar) > 1e-3:
-            if sar > tar:  # ref too wide -> crop width
-                nw = max(1, int(round(sh * tar)))
-                x0 = (sw - nw) // 2
-                x = x[:, :, :, x0:x0 + nw]
-            else:          # ref too tall -> crop height
-                nh = max(1, int(round(sw / tar)))
-                y0 = (sh - nh) // 2
-                x = x[:, :, y0:y0 + nh, :]
-        return F.interpolate(x, size=(th, tw), mode="bilinear")
-
-    def _fit_prep(self, c, th_px, tw_px):
-        """Fit protocol prep: AR-preserving resize to fit INSIDE the target, floor
-        /16 snap capped at the target dims (a grid larger than the target would need
-        s<1 position scaling -> rounding collisions; see the node-side ghosting bug).
-        NEAR-MATCHED AR (2026-07-15, mirrors the inference node's CROP_TOL branch):
-        within 8% of the target AR, minimally center-crop to the exact AR and fill
-        the target grid completely — otherwise bucket-AR quantization leaves 1-token
-        margins on ~20% of same-size pairs that inference never reproduces, and the
-        /16 floor squashes the fitted axis anisotropically."""
-        _, _, ih, iw = c.shape
-        sc = min(th_px / ih, tw_px / iw)
-        if ih * sc >= th_px * 0.92 and iw * sc >= tw_px * 0.92:
-            s = max(th_px / ih, tw_px / iw)
-            ch, cw = min(ih, int(round(th_px / s))), min(iw, int(round(tw_px / s)))
-            y0, x0 = (ih - ch) // 2, (iw - cw) // 2
-            c = c[:, :, y0:y0 + ch, x0:x0 + cw]
-            nh, nw = th_px, tw_px
-        else:
-            nh = min(max(16, int(ih * sc) // 16 * 16), max(16, th_px // 16 * 16))
-            nw = min(max(16, int(iw * sc) // 16 * 16), max(16, tw_px // 16 * 16))
-            # CROP-TO-GRID (2026-07-28 seam-doubling RCA, mirrors the node fix):
-            # resizing ih*sc -> floor16 squashes ref content up to 15px; the error
-            # peaks at the ref band edges = the outpaint seam, and ~43% of the
-            # v1.2-era vertical outpaint items ALSO hit an odd token gap (8px
-            # floored-center offset). Together these TRAINED IN the seam-doubling
-            # band. Center-crop the ref so the fitted axis lands on the /16 grid
-            # at scale sc exactly — zero squash; content matches RoPE stride-1.
-            ch2, cw2 = min(ih, max(1, int(round(nh / sc)))), min(iw, max(1, int(round(nw / sc))))
-            y0, x0 = (ih - ch2) // 2, (iw - cw2) // 2
-            c = c[:, :, y0:y0 + ch2, x0:x0 + cw2]
-        if (nh, nw) != tuple(c.shape[-2:]):
-            c = F.interpolate(c, size=(nh, nw), mode="bilinear", antialias=True)
+        Krea's VAE is /8 and the DiT patch is 2x2 latent cells, so each source image
+        must be divisible by 16 px. Replicating only the bottom/right edge preserves
+        every source pixel and leaves the source's own RoPE origin at (0, 0).
+        """
+        pad_h = (-c.shape[-2]) % 16
+        pad_w = (-c.shape[-1]) % 16
+        if pad_h or pad_w:
+            c = F.pad(c, (0, pad_w, 0, pad_h), mode="replicate")
         return c
 
     def condition_noisy_latents(self, latents: torch.Tensor, batch: "DataLoaderBatchDTO"):
@@ -566,8 +501,6 @@ class Krea2EditModel(Krea2Model):
             ctrl_list = getattr(batch, "control_tensor_list", None)
             if ctrl is None and ctrl_list:
                 # raw-control path: ragged per-item ref list (batch collates B=1)
-                th_px, tw_px = (batch.tensor.shape[2], batch.tensor.shape[3]) if batch.tensor is not None \
-                    else (batch.file_items[0].crop_height, batch.file_items[0].crop_width)
                 refs = ctrl_list[0] if isinstance(ctrl_list[0], (list, tuple)) else ctrl_list
                 self._check_ref_count(len(refs))
                 lats = []
@@ -575,45 +508,27 @@ class Krea2EditModel(Krea2Model):
                     if c.dim() == 3:
                         c = c.unsqueeze(0)
                     c = (c * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
-                    c = self._fit_prep(c, th_px, tw_px) if self.fit_refs \
-                        else self._fit_ref(c, th_px, tw_px)
+                    c = self._pad_reference_to_grid(c)
                     lats.append(self.encode_images(c).to(latents.device, latents.dtype))
                 self._control_latents = lats if len(lats) > 1 else lats[0]
                 if not getattr(self, "_edit_path_logged", False):
-                    print(f"[krea2_edit] {'FIT' if self.fit_refs else 'CROP (legacy)'} refs: "
+                    print(f"[krea2_edit] native-grid refs: "
                           f"{[tuple(l.shape[-2:]) for l in lats]} "
                           f"for target {tuple(latents.shape[-2:])}", flush=True)
                     self._edit_path_logged = True
                 return latents.detach()
             if ctrl is not None:
-                th, tw = (batch.tensor.shape[2], batch.tensor.shape[3]) if batch.tensor is not None \
-                    else (batch.file_items[0].crop_height, batch.file_items[0].crop_width)
-                # ROUTING FIX (2026-07-15, verifier showstopper): fit_refs previously
-                # applied ONLY to the raw control_tensor_list path (>=2 controls) —
-                # single-ref pairs (~80% of the pack, incl. the outpaint/sheet blocks
-                # whose whole point is AR-mismatch supervision) silently trained under
-                # the old crop protocol. Route every control through the active
-                # protocol prep; _fit_ref (crop) remains the non-fit fallback.
-                def _prep(c_):
-                    if self.fit_refs:
-                        c_ = self._fit_prep(c_, th, tw)
-                        if not getattr(self, "_fit_single_logged", False):
-                            print(f"[krea2_edit] FIT single-ref: {tuple(c_.shape[-2:])} "
-                                  f"for target {(th, tw)}", flush=True)
-                            self._fit_single_logged = True
-                        return c_
-                    return self._fit_ref(c_, th, tw)
                 if ctrl.dim() == 5:  # multi-ref: (B, N, C, H, W) -> list of per-ref latents
                     self._check_ref_count(ctrl.shape[1])
                     lats = []
                     for i in range(ctrl.shape[1]):
                         c_i = (ctrl[:, i] * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
-                        c_i = _prep(c_i)
+                        c_i = self._pad_reference_to_grid(c_i)
                         lats.append(self.encode_images(c_i).to(latents.device, latents.dtype))
                     self._control_latents = lats
                 else:
                     c = (ctrl * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
-                    c = _prep(c)
+                    c = self._pad_reference_to_grid(c)
                     self._control_latents = self.encode_images(c).to(latents.device, latents.dtype)
             else:
                 self._control_latents = None
@@ -668,8 +583,7 @@ class Krea2EditModel(Krea2Model):
             src = [_fit(s) for s in self._control_latents]
         else:
             src = _fit(self._control_latents)
-        return predict_velocity_edit(m, li, src, t, context, text_mask,
-                                     fit_offsets=self.fit_refs)
+        return predict_velocity_edit(m, li, src, t, context, text_mask)
 
     # --- semantic path: image-grounded Qwen3-VL encode ---
     def get_prompt_embeds(self, prompt, control_images=None) -> "AdvancedPromptEmbeds":

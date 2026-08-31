@@ -6,18 +6,16 @@ descriptively to identify the base model this trainer targets.*
 ☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU
 compute for future versions.
 
-This is the actual training code behind the released
-[krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit) LoRAs —
-not a reimplementation. Its reference geometry is geometry-matched to the
-[comfyui-krea2edit](https://github.com/lbouaraba/comfyui-krea2edit) inference nodes
-(v1.2.4+), so what you train is what the nodes run. "Geometry-matched" is exact about
-the things that misregister — fit dimensions, crop rectangles, and the centered
-fractional RoPE offsets are identical — but the two stacks do *not* use the same
-resample kernel, so reference pixels differ slightly below the geometry: the fit
-path resizes with bilinear + antialias here vs bicubic + antialias in the node, the
-legacy `fit_refs: false` crop path uses bilinear **without** antialias, and the
-grounding downscale uses PIL `LANCZOS` here vs `common_upscale(..., "area")` in the
-node. Geometry is exact; kernels are not.
+This fork uses an **independent native-grid reference geometry**: every reference
+keeps its own aspect ratio and starts its own `(h=0, w=0)` RoPE grid. References are
+never cropped or resized to the target; only bottom/right edge padding aligns them to
+the 16-pixel VAE/DiT lattice. The paired
+[comfyui-krea2edit](https://github.com/chinoll/comfyui-krea2edit) fork implements the
+same contract, so what you train is what the nodes run.
+
+This is intentionally incompatible with the released
+[krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit) LoRAs,
+which used target-fitted/centered reference geometry. Train a new LoRA for this mode.
 
 It adds one model architecture to [ai-toolkit](https://github.com/ostris/ai-toolkit):
 
@@ -30,9 +28,9 @@ It adds one model architecture to [ai-toolkit](https://github.com/ostris/ai-tool
 **Note on upstream's own edit mode:** ai-toolkit's built-in `krea2` arch also offers
 an edit mode (`model_kwargs: {edit: true}`). It is a *different training contract* —
 a "Picture N:"-labeled grounding template and an area-budget reference resize —
-whereas this extension implements the exact grounding template and fit-to-target-grid
-reference geometry that the comfyui-krea2edit nodes (and the released
-krea2-identity-edit LoRAs) use. Both are valid trainers; they are not interchangeable.
+whereas this extension implements the exact grounding template and independent
+native-grid reference geometry used by the paired comfyui-krea2edit fork. Both are
+valid trainers; they are not interchangeable.
 If you want LoRAs that pair with the identity-edit inference stack, train with
 `arch: "krea2_edit"` from this extension.
 
@@ -143,13 +141,12 @@ my_dataset/
   change `GROUNDING_MAX_PX` / `GROUNDING_JITTER_MIN`, delete the `_t_e_cache` folders
   in your dataset directories first — otherwise the run silently reuses embeddings
   built at the old grounding resolution.
-- **Fit reference protocol** (`fit` geometry, `model_kwargs: {fit_refs: true}` — the
-  default) — references are AR-preserving fitted to the target grid with exact /16
-  alignment and fractionally-centered positions. This matches the v1.2.4+ node
-  geometry exactly; older reimplementations that floor to /16 or use integer offsets
-  produce seam artifacts. `fit_refs: false` opts into the legacy v1/v1.1 crop
-  geometry, which then **requires** `fit_mode: "crop (legacy)"` at inference — the
-  trainer prints a loud warning when you select it.
+- **Independent native reference grids** — each source keeps its own native aspect
+  ratio and gets RoPE coordinates `(frame=i+1, h=0..Hr-1, w=0..Wr-1)`. It is never
+  cropped, target-fitted, or center-offset. The only spatial adjustment is
+  bottom/right replicate padding to a 16-pixel lattice for VAE/DiT patch alignment.
+  This requires a newly trained LoRA; it is not compatible with released fit/crop
+  weights.
 - **Separate reference time** — source latent tokens are clean and receive the DiT's
   `t=0` AdaLN modulation; noisy target tokens (and text) receive the sampled flow time.
   The implementation keeps the two modulation vectors as a small batch-concatenated
@@ -182,14 +179,14 @@ inference nodes cannot reproduce:
   renders the inherited plain-T2I pipeline (no reference tokens, no image-grounded
   text encode), so previews would not show what the LoRA actually does. Use
   `train: { disable_sampling: true }` and evaluate checkpoints in ComfyUI.
-- **`batch_size` > 1 with the fit protocol.** ai-toolkit collates raw control images
+- **`batch_size` > 1 with native reference grids.** ai-toolkit collates raw control images
   with `torch.cat`, which requires every source in a batch to have identical pixel
   dimensions; mixed-size datasets crash mid-run. Use `batch_size: 1` and raise
   `gradient_accumulation` instead.
 - **More than 2 references.** The nodes expose exactly two reference inputs
   (`source_image` + `source_image_b`), so at most two `control_path` entries. Checked
   at startup from the config, with a runtime backstop.
-- **Flip augmentation with the fit protocol** (`flip_x` / `flip_y` on a dataset).
+- **Flip augmentation with native reference grids** (`flip_x` / `flip_y` on a dataset).
   ai-toolkit flips the target image but *not* the raw control images, silently
   desyncing every flipped pair. Keep both false, or pre-flip pairs offline (flipping
   target *and* source together, as a separate dataset folder).

@@ -27,25 +27,20 @@ Each image token carries `(frame, h, w)`:
 - Text tokens: all-zero position ids.
 - Target grid: `h ∈ [0, H/16)`, `w ∈ [0, W/16)`, stride 1.
 
-## 3. Reference fit protocol (`fit_refs`)
+## 3. Independent native reference grids
 
-`model_kwargs: {fit_refs: true}` is the trainer default and corresponds to the node's
-`fit_mode: "fit"` (also its default). References are AR-preserving **fitted inside**
-the target token grid:
+References are neither cropped nor resized to the target. For a reference token grid
+`Hr × Wr`, its positions are exactly:
 
-1. Compute scale `s = min(target_h/src_h, target_w/src_w)` in pixel space.
-2. Token grid dims must be exact multiples of 16 px. **Do not floor-resize the scaled
-   source** (`src*s → floor16`) — that squashes content by up to 15 px, and the
-   misregistration peaks at the reference-band edges (renders as a doubled seam band
-   on outpaints). Instead **center-crop the source first** so that the fitted axis
-   lands on the /16 grid at scale `s` exactly, then resize. Zero squash by
-   construction.
-3. Reference tokens are placed at **fractionally centered offsets**:
-   `off = (target_grid - ref_grid) / 2` — floating point, NOT `// 2`. RoPE is
-   continuous; half-token positions are exact. Integer flooring places odd-gap
-   references 8 px off their true center.
-4. The reference grid is stride-1 (its pixels were resampled to target grid density);
-   never rescale the position grid itself.
+```
+(frame=i+1, h=0..Hr-1, w=0..Wr-1)
+```
+
+Target positions remain `(frame=0, h=0..Ht-1, w=0..Wt-1)`. Thus each image has an
+independent 2D coordinate system and frame index; no target-relative scale or centered
+offset is encoded. At pixel ingest, only bottom/right replicate padding to a multiple
+of 16 pixels is applied so the /8 VAE and 2×2 latent DiT patching divide exactly. No
+source pixel is removed or resampled.
 
 ## 4. Grounded text conditioning
 
@@ -56,13 +51,9 @@ The instruction is encoded by Qwen3-VL-4B **together with the reference images**
   reference, in frame order**, followed by the instruction text.
 - Output: hidden states of 12 selected layers `(2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35)`
   stacked to `(1, L, 12, hidden)`, with the first 34 tokens (system prefix) sliced off.
-- Under the fit protocol (`fit_refs: true`, the default) the grounding image is the
-  reference as delivered by the loader, i.e. at its **native resolution, before the
-  fit-to-target-grid resample** — the semantic path and the appearance path see
-  different pixels on purpose. This is only true under the fit protocol: with
-  `fit_refs: false` (legacy crop geometry) the loader hands over an already
-  target-sized control tensor, so the grounding image is the cropped/resized
-  reference, not the native one.
+- The grounding image is the reference as delivered by the loader, at its **native
+  resolution**. The appearance path uses the same content, with only 16-pixel edge
+  padding before VAE encoding.
 - The grounding image is then optionally downscaled: longest side capped at
   `GROUNDING_MAX_PX` (default **768**, matching the inference node's `grounding_px`)
   with per-step uniform jitter down to `GROUNDING_JITTER_MIN` (default **384**).

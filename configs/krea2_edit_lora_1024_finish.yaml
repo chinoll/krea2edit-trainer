@@ -62,6 +62,6 @@ config:
       model: { name_or_path: "krea/Krea-2-Raw", arch: "krea2_edit",
         quantize: true, quantize_te: true,     # fp8 base + TE — assumed by every
                                                # number in the README VRAM table
-        model_kwargs: { text_encoder_path: "Qwen/Qwen3-VL-4B-Instruct", fit_refs: true } }
+        model_kwargs: { text_encoder_path: "Qwen/Qwen3-VL-4B-Instruct" } }
       sample: { sample_every: 100000, samples: [] }
 meta: { name: "krea2_edit_lora", version: "1.0" }
