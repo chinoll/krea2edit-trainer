@@ -15,6 +15,7 @@ from krea2edit.modeling import (
     ConditioningModels,
     RaggedEditModel,
     add_lora,
+    export_comfyui_lora,
     load_dit,
     quantize_component,
     target_velocity_tokens,
@@ -25,7 +26,10 @@ from krea2edit.timesteps import sample_timesteps
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Krea2Edit ragged LoRA trainer")
-    parser.add_argument("--config", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--config")
+    mode.add_argument("--convert-adapter", type=Path)
+    parser.add_argument("--convert-output", type=Path)
     return parser.parse_args()
 
 
@@ -53,13 +57,30 @@ def save_checkpoint(accelerator, model, output_dir: Path, step: int):
     accelerator.save_state(checkpoint)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        adapter_dir = checkpoint / "adapter"
         accelerator.unwrap_model(model).dit.save_pretrained(
-            checkpoint / "adapter", safe_serialization=True
+            adapter_dir, safe_serialization=True
         )
+        export_comfyui_lora(
+            adapter_dir / "adapter_model.safetensors",
+            checkpoint / "krea2edit_comfyui.safetensors",
+        )
+    accelerator.wait_for_everyone()
 
 
 def main():
     args = parse_args()
+    if args.convert_adapter:
+        output = args.convert_output or args.convert_adapter.with_name(
+            "krea2edit_comfyui.safetensors"
+        )
+        export_comfyui_lora(
+            args.convert_adapter,
+            output,
+        )
+        print(output)
+        return
+
     config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     train_config = config["train"]
     deepspeed = None
@@ -170,7 +191,6 @@ def main():
                     noisy_targets,
                     reference_latents,
                     contexts,
-                    [sample["frames"] for sample in batch],
                     timesteps,
                 )
                 losses = [

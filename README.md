@@ -21,12 +21,12 @@ reference images + edit prompt
         │
         └─ Qwen-Image VAE 对每张参考图独立编码
 
-[grounded text | ref_1 | ... | ref_N | noisy target]
+[grounded text | noisy target | ref_1 | ... | ref_N]
         │
         └─ SingleStreamDiT
              ├─ text:   position=(0,0,0), sampled t
-             ├─ ref_i:  frame=i, independent (h,w), t=0 clean
-             └─ target: frame=0, independent (H,W), sampled t
+             ├─ target: frame=0, independent (H,W), sampled t
+             └─ ref_i:  frame=i, independent (h,w), t=0 clean
 ```
 
 参考图和目标图各自从 `(0,0)` 开始生成二维 RoPE 网格，没有 crop、padding 或目标图坐标偏移。每张图先保持比例执行单图像素上限，再轻微缩放到 16px 网格；因此原始输入 H/W 可以任意，目标和参考图也不需要相同比例或分辨率。
@@ -36,8 +36,8 @@ reference images + edit prompt
 DataLoader 不 stack 图像。一个 batch 内的 target H/W、参考图数量、参考图 H/W 和文本长度均可不同，也不需要 buckets。VAE 逐图编码后，每个样本形成一条独立序列，再用 `cu_seqlens` pack：
 
 ```text
-sample 0: [text_0 | refs_0 | target_0]
-sample 1: [text_1 | refs_1 | target_1]
+sample 0: [text_0 | target_0 | refs_0]
+sample 1: [text_1 | target_1 | refs_1]
 ...
 ```
 
@@ -76,8 +76,8 @@ Krea 2 RAW 为 gated model，需要先在 Hugging Face 接受许可，并设置 
 训练入口只读取 JSONL manifest。每行是一条独立样本：
 
 ```jsonl
-{"id":"edit-0001","target":{"image":"targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"scene","frame":1,"image":"refs/0001_scene.jpg"},{"id":"subject","frame":2,"image":"refs/0001_subject.png"}]}
-{"id":"edit-0002","target":{"image":"targets/0002.jpg","caption":"Make the jacket red."},"references":[{"id":"subject","frame":2,"image":"refs/0002_subject.jpg"}]}
+{"id":"edit-0001","target":{"image":"targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"scene","image":"refs/0001_scene.jpg"},{"id":"subject","image":"refs/0001_subject.png"}]}
+{"id":"edit-0002","target":{"image":"targets/0002.jpg","caption":"Make the jacket red."},"references":[{"id":"subject","image":"refs/0002_subject.jpg"}]}
 ```
 
 路径相对于 manifest 所在目录解析，也可以写绝对路径。字段含义：
@@ -85,9 +85,11 @@ Krea 2 RAW 为 gated model，需要先在 Hugging Face 接受许可，并设置 
 - `id`：样本 ID。
 - `target.image`：监督目标图。
 - `target.caption` 或 `target.prompt`：编辑指令。
-- `references`：一张或多张参考图；`frame` 是稳定的正整数 RoPE frame ID。
+- `references`：一张或多张参考图，数组顺序就是传给 ComfyUI 节点的参考图顺序。
 
-参考图按 `frame` 排序。某种角色缺失时不需要重新编号，例如只有 subject 时仍可使用 `frame: 2`。
+RoPE frame 不写入数据：训练时按数组顺序自动分配为 `1..N`。这与
+`comfyui-krea2edit` 的 `source_image`、`source_image_b`、`reference_images`
+拼接顺序一致；单参考图始终是 `frame=1`。
 完整样例见 [configs/manifest.example.jsonl](configs/manifest.example.jsonl)。
 
 ## 单图像素上限与任意分辨率
@@ -132,7 +134,8 @@ velocity target = noise - clean
 - `linear`：均匀采样。
 - `sigmoid`：AI-Toolkit 常用的 sigmoid-normal 分布。
 - `weighted`：AI-Toolkit 的 1000 点均匀 timestep 加原始逐 timestep loss-weight 表；权重表已内置，不依赖 AI-Toolkit。
-- `logit_normal`、`mode`：Diffusers density schemes。
+- `logit_normal`、`mode`：Diffusers density schemes；采样结果从 scheduler index
+  fraction 转换为 Krea 的 flow time（`t=1` 为噪声）。
 - `cosine_map`：均匀采样 timestep，并使用 Diffusers cosmap loss weighting。
 - `lognorm_blend`：75% log-normal 与 25% uniform 混合。
 - `shift`：按每个 target 的 DiT token 数独立应用 Krea dynamic shift，插值端点为 `(256, 0.5)` 与 `(6400, 1.15)`。
@@ -164,10 +167,29 @@ accelerate launch --config_file configs/accelerate_zero2.yaml \
 
 ```text
 output/krea2edit/checkpoint-00000250/
-├─ adapter/                 # PEFT LoRA adapter_model.safetensors + config
+├─ adapter/                         # PEFT 格式，用于继续训练或 PEFT 加载
+├─ krea2edit_comfyui.safetensors    # ComfyUI 可直接加载的 LoRA
 ├─ Accelerate/DeepSpeed model、optimizer 与 scheduler state
 └─ random_states_*.pkl
 ```
+
+把 `krea2edit_comfyui.safetensors` 复制到 `ComfyUI/models/loras/`，在 Krea 2
+模型和 `Krea2EditModelPatch` 之间使用 `Load LoRA Model Only` 加载。导出器会把
+PEFT 的 `base_model.model.` 前缀转换成 ComfyUI 的 `diffusion_model.`，并为每个
+LoRA 模块写入 `alpha`，因此
+`lora.alpha != lora.rank` 时 ComfyUI 的强度也与训练一致。不要把
+`adapter/adapter_model.safetensors` 直接交给 ComfyUI；它保留的是 PEFT 命名。
+
+已有 PEFT adapter 可以直接转换，不会启动训练：
+
+```bash
+python train.py \
+  --convert-adapter output/krea2edit/checkpoint-00000250/adapter/adapter_model.safetensors \
+  --convert-output output/krea2edit/krea2edit_comfyui.safetensors
+```
+
+转换时的 `alpha` 直接读取同目录 PEFT `adapter_config.json` 中的
+`lora_alpha`。
 
 从断点继续时设置：
 

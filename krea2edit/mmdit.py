@@ -73,28 +73,14 @@ def _flash_attention4_varlen(
 ) -> Tensor:
     """Invoke the FA4 CUTE varlen API (Hopper/Blackwell)."""
     from flash_attn.cute import flash_attn_varlen_func
-    try:
-        return flash_attn_varlen_func(
-            q.contiguous(), k.contiguous(), v.contiguous(),
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            causal=False,
-        )
-    except TypeError as exc:
-        # Early FA4 previews exposed the positional form. Keep this small ABI
-        # compatibility branch without changing the actual attention semantics.
-        try:
-            return flash_attn_varlen_func(
-                q.contiguous(), k.contiguous(), v.contiguous(), cu_seqlens,
-                cu_seqlens, max_seqlen, max_seqlen, causal=False,
-            )
-        except TypeError:
-            raise RuntimeError(
-                "Installed FlashAttention-4 does not expose the expected "
-                "flash_attn_varlen_func API. Upgrade with `pip install -U flash-attn-4`."
-            ) from exc
+    return flash_attn_varlen_func(
+        q.contiguous(), k.contiguous(), v.contiguous(),
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        causal=False,
+    )
 
 
 def _flash_attention2_varlen(
@@ -705,8 +691,8 @@ class SingleStreamDiT(nn.Module):
                 raise ValueError(
                     f"ref_token_count must be in [1, {imglen - 1}], got {ref_token_count}"
                 )
-            # The image sequence is [reference tokens | noisy target tokens]. Text
-            # and target retain the sampled flow time; reference tokens use t=0.
+            # The image sequence is [noisy target tokens | reference tokens]. Text
+            # and target retain the sampled flow time; the reference suffix uses t=0.
             clean_t = self.tmlp(
                 temb(
                     torch.zeros_like(flow_t),
@@ -718,7 +704,10 @@ class SingleStreamDiT(nn.Module):
             # Batch-concatenated vectors let every block select t=0 for the
             # reference span without a per-token time-conditioning allocation.
             tvec = torch.cat((tvec, self.tproj(clean_t)), dim=0)
-            clean_token_range = (txtlen, txtlen + ref_token_count)
+            clean_token_range = (
+                txtlen + imglen - ref_token_count,
+                txtlen + imglen,
+            )
 
         # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
         # Off by default: the trailing pad positions must be masked, and a dense pad-mask
@@ -776,7 +765,7 @@ class SingleStreamDiT(nn.Module):
         """Run the DiT over a ragged batch with FlashAttention-2/4 varlen kernels.
 
         Each element describes exactly one independent sequence:
-        ``[text_i | ref_1_i | ... | ref_N_i | target_i]``.  Only the main
+        ``[text_i | target_i | ref_1_i | ... | ref_N_i]``.  Only the main
         image/text DiT stream is packed; the tiny four-block text-fusion module is
         evaluated per sample so it never needs padding either.  Returned tensors are
         target-only patch predictions, one ``(L_target_i, patch_out)`` tensor each.
@@ -819,6 +808,7 @@ class SingleStreamDiT(nn.Module):
             txt = self.txtmlp(self.txtfusion(ctx.unsqueeze(0), mask=None).squeeze(0))
             img = self.first(img)
             txt_len, img_len = txt.shape[0], img.shape[0]
+            target_len = img_len - ref_len
             seq_len = txt_len + img_len
 
             sequences.append(torch.cat((txt, img), dim=0))
@@ -827,13 +817,13 @@ class SingleStreamDiT(nn.Module):
                 img_pos,
             ), dim=0))
             clean_masks.append(torch.cat((
-                torch.zeros(txt_len, dtype=torch.bool, device=img.device),
+                torch.zeros(txt_len + target_len, dtype=torch.bool, device=img.device),
                 torch.ones(ref_len, dtype=torch.bool, device=img.device),
-                torch.zeros(img_len - ref_len, dtype=torch.bool, device=img.device),
             )))
             target_masks.append(torch.cat((
-                torch.zeros(txt_len + ref_len, dtype=torch.bool, device=img.device),
-                torch.ones(img_len - ref_len, dtype=torch.bool, device=img.device),
+                torch.zeros(txt_len, dtype=torch.bool, device=img.device),
+                torch.ones(target_len, dtype=torch.bool, device=img.device),
+                torch.zeros(ref_len, dtype=torch.bool, device=img.device),
             )))
             sample_ids.append(torch.full((seq_len,), sample, dtype=torch.long, device=img.device))
             lengths.append(seq_len)

@@ -49,7 +49,7 @@ class EditManifestDataset(Dataset):
                 continue
             row = json.loads(line)
             target = row["target"]
-            references = sorted(row["references"], key=lambda item: item["frame"])
+            references = row["references"]
             self.samples.append(
                 {
                     "id": row["id"],
@@ -58,7 +58,6 @@ class EditManifestDataset(Dataset):
                     "references": [
                         {
                             "id": reference["id"],
-                            "frame": int(reference["frame"]),
                             "image": self._resolve(reference["image"]),
                         }
                         for reference in references
@@ -83,7 +82,6 @@ class EditManifestDataset(Dataset):
                 load_image(reference["image"], self.max_image_pixels)
                 for reference in sample["references"]
             ],
-            "frames": [reference["frame"] for reference in sample["references"]],
         }
 
 

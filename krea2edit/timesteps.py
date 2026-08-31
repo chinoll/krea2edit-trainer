@@ -1033,7 +1033,7 @@ def sample_timesteps(config: dict, batch_size: int, target_token_counts: list[in
         weights = torch.tensor(WEIGHTED_TIMESTEP_LOSS, device=device)[indices]
         return t, weights
     if strategy in {"logit_normal", "mode"}:
-        t = compute_density_for_timestep_sampling(
+        density = compute_density_for_timestep_sampling(
             weighting_scheme=strategy,
             batch_size=batch_size,
             logit_mean=float(config.get("logit_mean", 0.0)),
@@ -1041,6 +1041,9 @@ def sample_timesteps(config: dict, batch_size: int, target_token_counts: list[in
             mode_scale=float(config.get("mode_scale", 1.29)),
             device=device,
         )
+        # Diffusers returns a scheduler index fraction: index 0 is the noisiest
+        # flow step. Krea consumes sigma directly, where t=1 is noise.
+        t = 1.0 - density
         return t, torch.ones_like(t)
     if strategy in {"cosine_map", "cosmap"}:
         t = torch.rand(batch_size, device=device)

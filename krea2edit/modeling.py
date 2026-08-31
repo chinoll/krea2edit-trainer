@@ -1,3 +1,4 @@
+import json
 import os
 import random
 from pathlib import Path
@@ -8,7 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from huggingface_hub import hf_hub_download
 from peft import LoraConfig, get_peft_model
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from krea2edit.mmdit import SingleMMDiTConfig, SingleStreamDiT
 
@@ -89,6 +90,36 @@ def add_lora(model: SingleStreamDiT, config: dict):
         init_lora_weights="gaussian",
     )
     return get_peft_model(model, lora)
+
+
+def export_comfyui_lora(adapter_file: Path, output_file: Path):
+    """Convert a PEFT Krea 2 adapter into a ComfyUI-loadable safetensors file."""
+    adapter_config = json.loads(
+        adapter_file.with_name("adapter_config.json").read_text(encoding="utf-8")
+    )
+    alpha = int(adapter_config["lora_alpha"])
+    peft_state = load_file(str(adapter_file), device="cpu")
+    comfy_state = {}
+    lora_modules = []
+    for key, value in peft_state.items():
+        key = "diffusion_model." + key.removeprefix("base_model.model.")
+        comfy_state[key] = value.contiguous()
+        if key.endswith(".lora_A.weight"):
+            lora_modules.append(key.removesuffix(".lora_A.weight"))
+
+    for module_name in lora_modules:
+        comfy_state[f"{module_name}.alpha"] = torch.tensor(float(alpha))
+
+    save_file(
+        comfy_state,
+        str(output_file),
+        metadata={
+            "format": "pt",
+            "model": "krea2",
+            "architecture": "krea2edit",
+            "lora_alpha": str(alpha),
+        },
+    )
 
 
 class ConditioningModels:
@@ -180,23 +211,21 @@ class RaggedEditModel(nn.Module):
         noisy_targets: list[torch.Tensor],
         references: list[list[torch.Tensor]],
         contexts: list[torch.Tensor],
-        frames: list[list[int]],
         timesteps: torch.Tensor,
     ):
         patch = self.patch
-        image_tokens, positions, reference_lengths = [], [], []
-        for target, sample_refs, _, sample_frames in zip(
-            noisy_targets, references, contexts, frames
-        ):
+        image_tokens, positions, reference_lengths, target_lengths = [], [], [], []
+        for target, sample_refs in zip(noisy_targets, references):
             ref_tokens, ref_positions = [], []
-            for latent, frame in zip(sample_refs, sample_frames):
+            for frame, latent in enumerate(sample_refs, start=1):
                 tokens, pos = latent_tokens(latent, patch, frame)
                 ref_tokens.append(tokens)
                 ref_positions.append(pos)
             target_tokens, target_positions = latent_tokens(target, patch, 0)
-            image_tokens.append(torch.cat(ref_tokens + [target_tokens]))
-            positions.append(torch.cat(ref_positions + [target_positions]))
+            image_tokens.append(torch.cat([target_tokens] + ref_tokens))
+            positions.append(torch.cat([target_positions] + ref_positions))
             reference_lengths.append(sum(tokens.shape[0] for tokens in ref_tokens))
+            target_lengths.append(target_tokens.shape[0])
 
         if len(image_tokens) == 1:
             text_length = contexts[0].shape[0]
@@ -216,7 +245,7 @@ class RaggedEditModel(nn.Module):
                 mask=mask,
                 ref_token_count=reference_lengths[0],
             )[0]
-            return [prediction[reference_lengths[0]:]]
+            return [prediction[:target_lengths[0]]]
 
         return self.dit.forward_varlen(
             image_tokens=image_tokens,
