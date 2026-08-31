@@ -27,10 +27,11 @@ Each image token carries `(frame, h, w)`:
 - Text tokens: all-zero position ids.
 - Target grid: `h ∈ [0, H/16)`, `w ∈ [0, W/16)`, stride 1.
 
-## 3. Independent native reference grids
+## 3. Independent patch-aligned reference grids
 
-References are neither cropped nor resized to the target. For a reference token grid
-`Hr × Wr`, its positions are exactly:
+References are neither cropped nor resized to the target. Their pixel H and W are
+independently rounded to the nearest 16px lattice before VAE encoding. For the resulting
+reference token grid `Hr × Wr`, positions are exactly:
 
 ```
 (frame=i+1, h=0..Hr-1, w=0..Wr-1)
@@ -38,15 +39,16 @@ References are neither cropped nor resized to the target. For a reference token 
 
 Target positions remain `(frame=0, h=0..Ht-1, w=0..Wt-1)`. Thus each image has an
 independent 2D coordinate system and frame index; no target-relative scale or centered
-offset is encoded. At pixel ingest, only bottom/right replicate padding to a multiple
-of 16 pixels is applied so the /8 VAE and 2×2 latent DiT patching divide exactly. No
-source pixel is removed or resampled.
+offset is encoded. At pixel ingest, each source axis is independently resized to the
+nearest multiple of 16 pixels so the /8 VAE and 2×2 latent DiT patching divide exactly.
+No source pixel is cropped, although the small alignment resize can slightly change its
+aspect ratio.
 
 There is no learned fixed-size positional table: a target may occupy any spatial token
 grid that ai-toolkit's target-resolution/bucket settings produce, and each reference
-may have a different native grid. At inference the paired ComfyUI nodes can make an
-exact arbitrary-pixel target canvas by bottom/right alignment padding internally and
-cropping that pad after VAE decode.
+may have a different patch-aligned grid. At inference the paired ComfyUI nodes round
+each requested target axis to the nearest 16px alignment size and return that size
+directly after VAE decode.
 
 ## 4. Grounded text conditioning
 
@@ -58,8 +60,8 @@ The instruction is encoded by Qwen3-VL-4B **together with the reference images**
 - Output: hidden states of 12 selected layers `(2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35)`
   stacked to `(1, L, 12, hidden)`, with the first 34 tokens (system prefix) sliced off.
 - The grounding image is the reference as delivered by the loader, at its **native
-  resolution**. The appearance path uses the same content, with only 16-pixel edge
-  padding before VAE encoding.
+  resolution**. The appearance path uses the same content after its H and W are
+  independently resized to the nearest 16px grid before VAE encoding.
 - The grounding image is then optionally downscaled: longest side capped at
   `GROUNDING_MAX_PX` (default **768**, matching the inference node's `grounding_px`)
   with per-step uniform jitter down to `GROUNDING_JITTER_MIN` (default **384**).

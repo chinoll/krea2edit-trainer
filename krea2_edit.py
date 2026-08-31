@@ -133,16 +133,15 @@ class Krea2EditModel(Krea2Model):
         # route the control image to get_prompt_embeds (semantic grounding)
         self.encode_control_in_text_embeddings = True
         self._control_latents = None  # Tensor (single-ref) or List[Tensor] (multi-ref)
-        # Every image keeps its own native 2D grid.  The raw reference is neither
-        # cropped nor resized to the target; the frame axis makes its RoPE grid an
-        # independent coordinate system.  It is padded only to the VAE/DiT 16 px
-        # patch lattice, after which its latent is patchified normally.
+        # Every image keeps its own independent 2D grid. The raw reference is never
+        # cropped or target-fitted; it is resized by at most half a patch per axis to
+        # the nearest VAE/DiT 16px lattice before latent patchification.
         model_kwargs = model_config.model_kwargs or {}
         self.use_raw_control_images = True
         if "fit_refs" in model_kwargs:
             print("[krea2_edit] NOTE: model_kwargs.fit_refs is obsolete and ignored; "
-                  "references now always use independent native grids (no crop).")
-        print("[krea2_edit] NATIVE-GRID refs ENABLED (independent RoPE grids; no crop/resize)")
+                  "references now use independent patch-aligned grids (no crop).")
+        print("[krea2_edit] PATCH-ALIGNED refs ENABLED (independent RoPE grids; nearest-16px resize)")
         # Grounding policy, printed once so every run is self-documenting.
         _g_max, _g_jit = grounding_settings()
         print(f"[krea2_edit] grounding: GROUNDING_MAX_PX={_g_max} GROUNDING_JITTER_MIN={_g_jit} "
@@ -285,7 +284,7 @@ class Krea2EditModel(Krea2Model):
             if flipped:
                 raise ValueError(
                     "krea2_edit: flip augmentation (flip_x / flip_y) is not supported with the "
-                    "native independent-reference geometry.\n"
+                    "patch-aligned independent-reference geometry.\n"
                     "  ai-toolkit flips the TARGET image but not the raw control (reference) "
                     "images, so every flipped pair is silently desynced — the LoRA is trained "
                     "on mirrored supervision.\n"
@@ -418,17 +417,19 @@ class Krea2EditModel(Krea2Model):
 
     # --- appearance path: stash the source latent for the prediction step ---
     @staticmethod
-    def _pad_reference_to_grid(c):
-        """Pad (never crop or resize) a reference for VAE / DiT patch alignment.
+    def _resize_reference_to_grid(c):
+        """Resize a reference to the nearest VAE / DiT patch grid.
 
         Krea's VAE is /8 and the DiT patch is 2x2 latent cells, so each source image
-        must be divisible by 16 px. Replicating only the bottom/right edge preserves
-        every source pixel and leaves the source's own RoPE origin at (0, 0).
+        must be divisible by 16 px. Resize H and W independently to the closest grid
+        (rather than padding or cropping) and retain the source's own RoPE origin.
         """
-        pad_h = (-c.shape[-2]) % 16
-        pad_w = (-c.shape[-1]) % 16
-        if pad_h or pad_w:
-            c = F.pad(c, (0, pad_w, 0, pad_h), mode="replicate")
+        h, w = c.shape[-2:]
+        aligned_h = max(16, ((h + 8) // 16) * 16)
+        aligned_w = max(16, ((w + 8) // 16) * 16)
+        if (aligned_h, aligned_w) != (h, w):
+            c = F.interpolate(c, size=(aligned_h, aligned_w), mode="bilinear",
+                              align_corners=False)
         return c
 
     def condition_noisy_latents(self, latents: torch.Tensor, batch: "DataLoaderBatchDTO"):
@@ -443,11 +444,11 @@ class Krea2EditModel(Krea2Model):
                     if c.dim() == 3:
                         c = c.unsqueeze(0)
                     c = (c * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
-                    c = self._pad_reference_to_grid(c)
+                    c = self._resize_reference_to_grid(c)
                     lats.append(self.encode_images(c).to(latents.device, latents.dtype))
                 self._control_latents = lats if len(lats) > 1 else lats[0]
                 if not getattr(self, "_edit_path_logged", False):
-                    print(f"[krea2_edit] native-grid refs: "
+                    print(f"[krea2_edit] patch-aligned refs: "
                           f"{[tuple(l.shape[-2:]) for l in lats]} "
                           f"for target {tuple(latents.shape[-2:])}", flush=True)
                     self._edit_path_logged = True
@@ -457,12 +458,12 @@ class Krea2EditModel(Krea2Model):
                     lats = []
                     for i in range(ctrl.shape[1]):
                         c_i = (ctrl[:, i] * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
-                        c_i = self._pad_reference_to_grid(c_i)
+                        c_i = self._resize_reference_to_grid(c_i)
                         lats.append(self.encode_images(c_i).to(latents.device, latents.dtype))
                     self._control_latents = lats
                 else:
                     c = (ctrl * 2 - 1).to(self.vae_device_torch, dtype=self.torch_dtype)
-                    c = self._pad_reference_to_grid(c)
+                    c = self._resize_reference_to_grid(c)
                     self._control_latents = self.encode_images(c).to(latents.device, latents.dtype)
             else:
                 self._control_latents = None

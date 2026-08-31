@@ -6,18 +6,18 @@ descriptively to identify the base model this trainer targets.*
 ☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU
 compute for future versions.
 
-This fork uses an **independent native-grid reference geometry**: every reference
-keeps its own aspect ratio and starts its own `(h=0, w=0)` RoPE grid. References are
-never cropped or resized to the target; only bottom/right edge padding aligns them to
-the 16-pixel VAE/DiT lattice. The paired
+This fork uses an **independent patch-aligned reference geometry**: every reference
+starts its own `(h=0, w=0)` RoPE grid. References are never cropped or resized to the
+target; their H and W are independently rounded to the nearest 16-pixel VAE/DiT
+lattice. The paired
 [comfyui-krea2edit](https://github.com/chinoll/comfyui-krea2edit) fork implements the
 same contract, so what you train is what the nodes run.
 
 There is no fixed DiT spatial-position table: targets use their own H×W grid from the
-ai-toolkit dataset resolution/buckets, while every source retains an independent native
-grid. The paired nodes can sample any requested output pixel size by alignment-padding
-internally and cropping that padding after VAE decode; VRAM and the trained resolution
-range, rather than a hard geometry limit, are the practical constraints.
+ai-toolkit dataset resolution/buckets, while every source retains an independent
+patch-aligned grid. The paired nodes accept any requested output pixel size and round
+each axis to the nearest 16px grid; VRAM and the trained resolution range, rather than
+a hard geometry limit, are the practical constraints.
 
 This is intentionally incompatible with the released
 [krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit) LoRAs,
@@ -35,7 +35,7 @@ It adds one model architecture to [ai-toolkit](https://github.com/ostris/ai-tool
 an edit mode (`model_kwargs: {edit: true}`). It is a *different training contract* —
 a "Picture N:"-labeled grounding template and an area-budget reference resize —
 whereas this extension implements the exact grounding template and independent
-native-grid reference geometry used by the paired comfyui-krea2edit fork. Both are
+patch-aligned reference geometry used by the paired comfyui-krea2edit fork. Both are
 valid trainers; they are not interchangeable.
 If you want LoRAs that pair with the identity-edit inference stack, train with
 `arch: "krea2_edit"` from this extension.
@@ -142,17 +142,17 @@ my_dataset/
   change `GROUNDING_MAX_PX` / `GROUNDING_JITTER_MIN`, delete the `_t_e_cache` folders
   in your dataset directories first — otherwise the run silently reuses embeddings
   built at the old grounding resolution.
-- **Independent native reference grids** — each source keeps its own native aspect
-  ratio and gets RoPE coordinates `(frame=i+1, h=0..Hr-1, w=0..Wr-1)`. It is never
-  cropped, target-fitted, or center-offset. The only spatial adjustment is
-  bottom/right replicate padding to a 16-pixel lattice for VAE/DiT patch alignment.
+- **Independent patch-aligned reference grids** — each source gets RoPE coordinates
+  `(frame=i+1, h=0..Hr-1, w=0..Wr-1)`. It is never cropped, target-fitted, or
+  center-offset. H and W are independently resized to the nearest 16-pixel lattice
+  for VAE/DiT patch alignment.
   This requires a newly trained LoRA; it is not compatible with released fit/crop
   weights.
 - **Arbitrary target grids** — target H×W remains independent of every reference and
   is represented directly by Krea2's RoPE grid; set ai-toolkit's normal target
   resolution/bucket policy for training. At inference the paired
-  `Krea2EditEmptyLatent` / `Krea2EditVAEDecode` nodes preserve any requested pixel
-  output size, using and then removing bottom/right alignment padding only.
+  `Krea2EditEmptyLatent` / `Krea2EditVAEDecode` nodes round any requested pixel
+  output H×W to their nearest 16px-aligned size.
 - **Separate reference time** — source latent tokens are clean and receive the DiT's
   `t=0` AdaLN modulation; noisy target tokens (and text) receive the sampled flow time.
   The implementation keeps the two modulation vectors as a small batch-concatenated
@@ -185,14 +185,14 @@ inference nodes cannot reproduce:
   renders the inherited plain-T2I pipeline (no reference tokens, no image-grounded
   text encode), so previews would not show what the LoRA actually does. Use
   `train: { disable_sampling: true }` and evaluate checkpoints in ComfyUI.
-- **`batch_size` > 1 with native reference grids.** ai-toolkit collates raw control images
+- **`batch_size` > 1 with patch-aligned reference grids.** ai-toolkit collates raw control images
   with `torch.cat`, which requires every source in a batch to have identical pixel
   dimensions; mixed-size datasets crash mid-run. Use `batch_size: 1` and raise
   `gradient_accumulation` instead.
 - **Reference count is bounded by context length and VRAM.** Every reference adds a
   full VAE token grid and Qwen3-VL vision block. Start with a small number and avoid
   high-resolution references unless you have measured the resulting memory use.
-- **Flip augmentation with native reference grids** (`flip_x` / `flip_y` on a dataset).
+- **Flip augmentation with patch-aligned reference grids** (`flip_x` / `flip_y` on a dataset).
   ai-toolkit flips the target image but *not* the raw control images, silently
   desyncing every flipped pair. Keep both false, or pre-flip pairs offline (flipping
   target *and* source together, as a separate dataset folder).
