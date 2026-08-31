@@ -13,6 +13,12 @@ the 16-pixel VAE/DiT lattice. The paired
 [comfyui-krea2edit](https://github.com/chinoll/comfyui-krea2edit) fork implements the
 same contract, so what you train is what the nodes run.
 
+There is no fixed DiT spatial-position table: targets use their own H×W grid from the
+ai-toolkit dataset resolution/buckets, while every source retains an independent native
+grid. The paired nodes can sample any requested output pixel size by alignment-padding
+internally and cropping that padding after VAE decode; VRAM and the trained resolution
+range, rather than a hard geometry limit, are the practical constraints.
+
 This is intentionally incompatible with the released
 [krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit) LoRAs,
 which used target-fitted/centered reference geometry. Train a new LoRA for this mode.
@@ -38,7 +44,7 @@ If you want LoRAs that pair with the identity-edit inference stack, train with
 
 ```bash
 cd ai-toolkit/extensions
-git clone https://github.com/lbouaraba/krea2edit-trainer krea2_edit
+git clone https://github.com/chinoll/krea2edit-trainer krea2_edit
 ```
 
 That's it — ai-toolkit discovers extensions in that folder. Set `arch: "krea2_edit"`
@@ -111,8 +117,6 @@ my_dataset/
   pre-flip pairs offline (both images) if you want mirror augmentation.
 - **`batch_size: 1`** — raw control images of mixed sizes cannot be collated (see
   "Not supported" below). Use `gradient_accumulation` for a larger effective batch.
-- At most **two** `control_path` entries: the inference nodes take `source_image` and
-  `source_image_b`, nothing more.
 
 ## The recipe, in short
 
@@ -144,6 +148,11 @@ my_dataset/
   bottom/right replicate padding to a 16-pixel lattice for VAE/DiT patch alignment.
   This requires a newly trained LoRA; it is not compatible with released fit/crop
   weights.
+- **Arbitrary target grids** — target H×W remains independent of every reference and
+  is represented directly by Krea2's RoPE grid; set ai-toolkit's normal target
+  resolution/bucket policy for training. At inference the paired
+  `Krea2EditEmptyLatent` / `Krea2EditVAEDecode` nodes preserve any requested pixel
+  output size, using and then removing bottom/right alignment padding only.
 - **Separate reference time** — source latent tokens are clean and receive the DiT's
   `t=0` AdaLN modulation; noisy target tokens (and text) receive the sampled flow time.
   The implementation keeps the two modulation vectors as a small batch-concatenated

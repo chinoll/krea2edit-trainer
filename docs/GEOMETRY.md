@@ -2,7 +2,7 @@
 
 This document pins the *exact* reference geometry and conditioning semantics of
 `krea2_edit` training, so that inference stacks and third-party trainers can verify
-parity instead of guessing. The [comfyui-krea2edit](https://github.com/lbouaraba/comfyui-krea2edit)
+parity instead of guessing. The [comfyui-krea2edit](https://github.com/chinoll/comfyui-krea2edit)
 nodes (v1.2.4+) implement the same contract; LoRAs trained against a different
 geometry will misregister at inference (blur, off-center ghosting, seam artifacts).
 
@@ -41,6 +41,12 @@ independent 2D coordinate system and frame index; no target-relative scale or ce
 offset is encoded. At pixel ingest, only bottom/right replicate padding to a multiple
 of 16 pixels is applied so the /8 VAE and 2×2 latent DiT patching divide exactly. No
 source pixel is removed or resampled.
+
+There is no learned fixed-size positional table: a target may occupy any spatial token
+grid that ai-toolkit's target-resolution/bucket settings produce, and each reference
+may have a different native grid. At inference the paired ComfyUI nodes can make an
+exact arbitrary-pixel target canvas by bottom/right alignment padding internally and
+cropping that pad after VAE decode.
 
 ## 4. Grounded text conditioning
 
