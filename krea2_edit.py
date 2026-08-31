@@ -128,7 +128,16 @@ def predict_velocity_edit(
     pos = torch.cat([txtpos] + src_poss + [tgt_pos], dim=1)
     mask = torch.cat([text_mask.to(target_latents.device).bool()] + src_masks + [tgt_mask], dim=1)
 
-    out = model(img=img_tokens, context=context, t=t, pos=pos, mask=mask)  # [refs... ; tgt_out]
+    out = model(
+        img=img_tokens,
+        context=context,
+        t=t,
+        pos=pos,
+        mask=mask,
+        # Ref latent values are clean already. This also gives their transformer
+        # modulation the clean endpoint t=0, while text/target stay at sampled t.
+        ref_token_count=src_len,
+    )  # [refs... ; tgt_out]
     target_out = out[:, src_len:]  # keep only the target tokens
     velocity = rearrange(
         target_out, "b (h w) (c ph pw) -> b c (h ph) (w pw)",

@@ -150,6 +150,10 @@ my_dataset/
   produce seam artifacts. `fit_refs: false` opts into the legacy v1/v1.1 crop
   geometry, which then **requires** `fit_mode: "crop (legacy)"` at inference — the
   trainer prints a loud warning when you select it.
+- **Separate reference time** — source latent tokens are clean and receive the DiT's
+  `t=0` AdaLN modulation; noisy target tokens (and text) receive the sampled flow time.
+  The implementation keeps the two modulation vectors as a small batch-concatenated
+  pair, while attention still runs across the complete reference/target sequence.
 - **Weighted flow-matching** — `timestep_type: "weighted"`: uniform timestep sampling
   with a per-timestep loss weight table.
 - **Two-stage training works well**: a bulk skill/identity stage at 512, then a short

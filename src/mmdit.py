@@ -328,8 +328,88 @@ class SingleStreamBlock(nn.Module):
         self.mlp = SwiGLU(features, multiplier, bias)
 
     def forward(
-        self, x: Tensor, vec: Tensor, freqs: Tensor, mask: Tensor | None = None
+        self,
+        x: Tensor,
+        vec: Tensor,
+        freqs: Tensor,
+        mask: Tensor | None = None,
+        clean_token_range: tuple[int, int] | None = None,
     ) -> Tensor:
+        """Apply AdaLN-single modulation, optionally using ``t=0`` for one span.
+
+        ``vec`` contains the normal target-timestep modulation vector. When
+        ``clean_token_range`` is provided it is batch-concatenated with the
+        matching ``t=0`` vector: ``[target_t (B) ; clean_t (B)]``. Keeping this
+        as a 2B stack (rather than materializing B x sequence x 6D modulation values)
+        preserves the reference architecture's memory profile.  Attention remains
+        over the full sequence, so clean reference tokens can still interact with
+        noisy target tokens at every block.
+        """
+        if clean_token_range is not None:
+            if vec.shape[0] != 2 * x.shape[0]:
+                raise ValueError(
+                    "clean_token_range requires [target_t ; clean_t] modulation vectors"
+                )
+            start, end = clean_token_range
+            if not (0 <= start < end <= x.shape[1]):
+                raise ValueError(
+                    f"invalid clean token range [{start}, {end}) for sequence length {x.shape[1]}"
+                )
+            (
+                prescale,
+                preshift,
+                pregate,
+                postscale,
+                postshift,
+                postgate,
+            ) = self.mod(vec)
+            bs = x.shape[0]
+            (
+                clean_prescale,
+                clean_preshift,
+                clean_pregate,
+                clean_postscale,
+                clean_postshift,
+                clean_postgate,
+            ) = (
+                prescale[bs:],
+                preshift[bs:],
+                pregate[bs:],
+                postscale[bs:],
+                postshift[bs:],
+                postgate[bs:],
+            )
+            prescale, preshift, pregate, postscale, postshift, postgate = (
+                prescale[:bs],
+                preshift[:bs],
+                pregate[:bs],
+                postscale[:bs],
+                postshift[:bs],
+                postgate[:bs],
+            )
+
+            pre_norm = self.prenorm(x)
+            pre = (1 + prescale) * pre_norm + preshift
+            pre[:, start:end] = (
+                (1 + clean_prescale) * pre_norm[:, start:end] + clean_preshift
+            )
+            attn = self.attn(pre, freqs, mask)
+            attn[:, :start] *= pregate
+            attn[:, start:end] *= clean_pregate
+            attn[:, end:] *= pregate
+            x = x + attn
+
+            post_norm = self.postnorm(x)
+            post = (1 + postscale) * post_norm + postshift
+            post[:, start:end] = (
+                (1 + clean_postscale) * post_norm[:, start:end] + clean_postshift
+            )
+            mlp = self.mlp(post)
+            mlp[:, :start] *= postgate
+            mlp[:, start:end] *= clean_postgate
+            mlp[:, end:] *= postgate
+            return x + mlp
+
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
         x = x + pregate * self.attn(
             (1 + prescale) * self.prenorm(x) + preshift, freqs, mask
@@ -419,9 +499,13 @@ class SingleStreamDiT(nn.Module):
         t: Tensor,
         pos: Tensor,
         mask: Tensor | None = None,
+        ref_token_count: int = 0,
     ) -> Tensor:
         img = self.first(img)
-        t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
+        flow_t = t
+        t = self.tmlp(
+            temb(flow_t, self.config.tdim, device=img.device, dtype=img.dtype)
+        )
         tvec = self.tproj(t)
 
         _tm = mask[:, : context.shape[1]]
@@ -432,6 +516,26 @@ class SingleStreamDiT(nn.Module):
 
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = torch.cat((context, img), dim=1)
+        clean_token_range = None
+        if ref_token_count:
+            if not 0 < ref_token_count < imglen:
+                raise ValueError(
+                    f"ref_token_count must be in [1, {imglen - 1}], got {ref_token_count}"
+                )
+            # The image sequence is [reference tokens | noisy target tokens]. Text
+            # and target retain the sampled flow time; reference tokens use t=0.
+            clean_t = self.tmlp(
+                temb(
+                    torch.zeros_like(flow_t),
+                    self.config.tdim,
+                    device=img.device,
+                    dtype=img.dtype,
+                )
+            )
+            # Batch-concatenated vectors let every block select t=0 for the
+            # reference span without a per-token time-conditioning allocation.
+            tvec = torch.cat((tvec, self.tproj(clean_t)), dim=0)
+            clean_token_range = (txtlen, txtlen + ref_token_count)
 
         # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
         # Off by default: the trailing pad positions must be masked, and a dense pad-mask
@@ -465,10 +569,13 @@ class SingleStreamDiT(nn.Module):
                     tvec,
                     freqs,
                     mask,
+                    clean_token_range,
                     use_reentrant=False,
                 )
             else:
-                combined = block(combined, tvec, freqs, mask)
+                combined = block(
+                    combined, tvec, freqs, mask, clean_token_range
+                )
 
         final = self.last(combined, t)
         output = final[:, txtlen : txtlen + imglen, :]
