@@ -1,282 +1,169 @@
-# krea2edit trainer — ai-toolkit extension
+# Krea2Edit Trainer — Ragged Multi-Reference Architecture
 
-*Community project — not affiliated with or endorsed by Krea.ai. "Krea" is used
-descriptively to identify the base model this trainer targets.*
+This is a **new training architecture**, not a small patch to the original
+Krea2Edit trainer. It is designed for in-context image editing with independent,
+multi-reference inputs and variable reference resolutions. Checkpoints trained with
+this repository are **not compatible** with the released target-fitted/cropped
+Krea2 identity-edit LoRAs; train a new LoRA for this architecture.
 
-☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU
-compute for future versions.
+Upstream references:
 
-This fork uses an **independent patch-aligned reference geometry**: every reference
-starts its own `(h=0, w=0)` RoPE grid. References are never cropped or resized to the
-target; their H and W are independently rounded to the nearest 16-pixel VAE/DiT
-lattice. The paired
-[comfyui-krea2edit](https://github.com/chinoll/comfyui-krea2edit) fork implements the
-same contract, so what you train is what the nodes run.
+- Original trainer: [lbouaraba/krea2edit-trainer](https://github.com/lbouaraba/krea2edit-trainer)
+- Training framework: [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit)
 
-There is no fixed DiT spatial-position table: targets use their own H×W grid from the
-ai-toolkit dataset resolution/buckets, while every source retains an independent
-patch-aligned grid. The paired nodes accept any requested output pixel size and round
-each axis to the nearest 16px grid; VRAM and the trained resolution range, rather than
-a hard geometry limit, are the practical constraints.
+The upstream repositories do not provide this exact training contract. This fork
+keeps ai-toolkit's target/noise/loss loop, but replaces the edit-conditioning path
+with the architecture described below.
 
-For training with `batch_size > 1`, this extension keeps references as ragged
-per-sample lists and uses FlashAttention-4's varlen kernel for the main DiT stream.
-Every sample may have a different number of references and each reference may have a
-different H×W. Targets are intentionally **not** ragged: ai-toolkit's scheduler and
-flow-matching loss require the target images in one batch to share a bucket/grid.
+## Architecture
 
-This is intentionally incompatible with the released
-[krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit) LoRAs,
-which used target-fitted/centered reference geometry. Train a new LoRA for this mode.
+```text
+reference images + instruction
+        │
+        ├─ Qwen3-VL ──► remove visual hidden states ──► grounded language tokens
+        │
+        └─ per-reference VAE encode ──► clean reference latent tokens
 
-It adds one model architecture to [ai-toolkit](https://github.com/ostris/ai-toolkit):
+[grounded text | ref_1 | ... | ref_N | noisy target]
+        │
+        └─ packed DiT attention
+             ├─ reference blocks: frame = 1..N, timestep = 0
+             ├─ target block:     frame = 0,    timestep = sampled t
+             └─ text block:       position = (0, 0, 0), timestep = sampled t
+```
 
-- `krea2_edit` — instruction-based, reference-conditioned editing (the identity-edit
-  recipe): in-context reference tokens + image-grounded text conditioning
+The VLM sees the source images, but its visual-token hidden states are removed before
+the DiT. Therefore visual semantics reach the DiT through image-grounded language
+states, while source appearance and layout reach it through the clean VAE latent
+reference blocks.
 
-(Plain Krea 2 text-to-image training is already built into upstream ai-toolkit as
-`arch: "krea2"` — this extension doesn't duplicate it.)
+Each reference starts a separate RoPE grid:
 
-**Note on upstream's own edit mode:** ai-toolkit's built-in `krea2` arch also offers
-an edit mode (`model_kwargs: {edit: true}`). It is a *different training contract* —
-a "Picture N:"-labeled grounding template and an area-budget reference resize —
-whereas this extension implements the exact grounding template and independent
-patch-aligned reference geometry used by the paired comfyui-krea2edit fork. Both are
-valid trainers; they are not interchangeable.
-If you want LoRAs that pair with the identity-edit inference stack, train with
-`arch: "krea2_edit"` from this extension.
+```text
+ref_i: (frame=i, h=0..H_i-1, w=0..W_i-1)
+target: (frame=0, h=0..H_t-1, w=0..W_t-1)
+```
+
+There is no crop, target fitting, or coordinate offset for references.
+
+## Ragged reference batches
+
+`batch_size > 1` is supported when reference images differ in resolution or number.
+The extension replaces ai-toolkit's dense raw-control collation with a per-sample
+reference list, VAE-encodes every reference independently, then packs each sample's
+`[text | refs | target]` sequence using `cu_seqlens`.
+
+The main DiT attention automatically selects an unpadded varlen backend:
+
+| GPU | Backend | Install |
+| --- | --- | --- |
+| A100 / A800 / other Ampere or Ada | FlashAttention-2 | `pip install flash-attn` |
+| H100 / H200 / Blackwell | FlashAttention-4 preferred | `pip install flash-attn-4` |
+
+On Hopper and newer, FA2 remains a varlen fallback if FA4 is unavailable and the
+installed FA2 build supports that GPU. There is intentionally no padding+SDPA fallback
+for ragged B>1 batches.
+
+`batch_size: 1` retains the regular PyTorch SDPA path and does not require either
+FlashAttention package.
+
+## Per-image pixel budget
+
+Every raw image entering the edit-conditioning branch is limited independently by
+`model_kwargs.max_image_pixels`
+(default: `1048576`, i.e. 1 MP). If `H × W` exceeds the limit, it is downscaled by
+`sqrt(limit / (H × W))`, preserving aspect ratio, and then aligned to the 16px
+VAE/DiT grid. The final alignment rounds down when needed, so the pixel limit remains
+a real ceiling. Set `0` to disable the cap.
+
+The limit is applied before both VAE encoding and Qwen3-VL grounding during training.
+ComfyUI inference deliberately keeps its existing arbitrary-size, 16px-aligned input
+behavior and does not expose this training-only cap.
 
 ## Install
+
+Install a current [ai-toolkit](https://github.com/ostris/ai-toolkit), then clone this
+repository into its extension directory:
 
 ```bash
 cd ai-toolkit/extensions
 git clone https://github.com/chinoll/krea2edit-trainer krea2_edit
 ```
 
-For ragged-reference `batch_size > 1` training, also install FlashAttention-4 in the
-same environment (Hopper/Blackwell CUDA GPU required):
+Install the FlashAttention package appropriate for the training GPU when using
+`batch_size > 1` ragged references. Launch from the ai-toolkit root:
 
 ```bash
-pip install flash-attn-4
-```
-
-That's it — ai-toolkit discovers extensions in that folder. Set `arch: "krea2_edit"`
-in your config. Python **3.10+** is required (the source uses PEP 604 `X | None`
-annotations at runtime).
-
-**This extension is CLI-only** (`python run.py <config>`): ai-toolkit's web UI job
-builder has a hardcoded architecture list that does not include `krea2_edit`, so the
-arch will not appear there. Write the YAML config and launch it from the command
-line — and launch **from the ai-toolkit root**, because ai-toolkit resolves a config
-path against its own `config/` folder and then the current directory:
-
-```bash
-cd ai-toolkit
 python run.py extensions/krea2_edit/configs/krea2_edit_lora_512.yaml
 ```
 
-## Model access
-
-Krea 2 RAW weights are gated: accept the license at
-[krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw), then point
-`model.name_or_path` at the single-file `.safetensors` checkpoint (or a folder
-containing one — the sharded diffusers layout is not supported). Setting it to the
-repo id `krea/Krea-2-Raw` also works: the single-file checkpoint is downloaded for
-you (set `HF_TOKEN` for the gated repo). Non-default filenames:
-`model.model_kwargs.checkpoint_filename`.
+Python 3.10+ is required. Krea 2 RAW is gated; accept its license and provide a valid
+Hugging Face token if needed.
 
 ## Dataset layout
 
-Standard ai-toolkit paired-image datasets:
+ai-toolkit pairs target and reference files by stem:
 
+```text
+data/my_dataset/
+├── targets/
+│   ├── 0001.png
+│   └── 0001.txt        # edit instruction, not target-image caption
+├── sources/
+│   └── 0001.jpg
+└── sources_b/          # optional second reference family
+    └── 0001.png
 ```
-my_dataset/
-  targets/          # edited result images + .txt captions (the edit instruction)
-    0001.png
-    0001.txt
-  sources/          # reference images, stem-matched to targets
-    0001.png
-  sources_b/        # optional additional reference, stem-matched
-    0001.png
+
+Every `control_path` becomes one ordered reference block. References may have
+different dimensions and a sample may have a different number of matched references,
+subject to available context length and VRAM.
+
+## Minimal configuration
+
+```yaml
+datasets:
+  - folder_path: data/my_dataset/targets
+    control_path: [data/my_dataset/sources, data/my_dataset/sources_b]
+    caption_ext: txt
+    resolution: [512]
+    buckets: true
+    cache_latents_to_disk: true
+    cache_text_embeddings: false
+
+train:
+  batch_size: 2
+  gradient_checkpointing: true
+  unload_text_encoder: false
+  disable_sampling: true
+
+model:
+  name_or_path: krea/Krea-2-Raw
+  arch: krea2_edit
+  model_kwargs:
+    text_encoder_path: Qwen/Qwen3-VL-4B-Instruct
+    max_image_pixels: 1048576
 ```
 
-- `folder_path` → `targets/`, `control_path` → `["sources/"]`. Add as many additional
-  source folders as needed; every entry becomes a reference block in list order.
-- **Every target needs a stem-matched source.** ai-toolkit pairs by filename stem
-  only: for `targets/0001.png` it looks for `sources/0001.{jpg,jpeg,png,webp}`.
-  Extensions may differ, stems may not. A target with no match keeps its caption,
-  loses its reference, and **silently trains as plain T2I** — so an off-by-one naming
-  slip degrades the run without any error. The trainer now audits the pairing at
-  startup (filenames only) and refuses to start if any target is unpaired; it also
-  warns loudly if a two-reference dataset has targets matched by only one of the two
-  `control_path` folders (those items shift reference order — a target matched only
-  by `sources_b/` gets it as reference #1).
-- The caption is the *instruction* ("place her on a beach at sunset"), not a
-  description of the target.
-- Targets-only datasets (no `control_path`) train as plain T2I through the same arch —
-  useful as regularization. Keep them as their own dataset entry; don't leave
-  unpaired targets sitting in an edit dataset.
-- **`cache_text_embeddings` must be `false`** to keep the per-step grounding jitter:
-  text conditioning is image-grounded and re-jittered every step (see below), and a
-  cached embedding freezes one grounding scale. The 24 GB tier deliberately trades
-  that away — see the VRAM section.
-- **Any number of references is supported.** Each `control_path` entry becomes a
-  clean VAE token block and a Qwen3-VL vision block in the same order. The trainer
-  always advertises multi-image support to ai-toolkit's cached-text path, so semantic
-  grounding includes every configured reference without `model_kwargs.multi_ref`.
-- **`flip_x` / `flip_y` must stay false** on edit datasets: ai-toolkit flips the
-  target image but not the raw control (reference) images, so every flipped pair is
-  silently desynced. The trainer raises on this when it can see the dataset config;
-  pre-flip pairs offline (both images) if you want mirror augmentation.
-- **`batch_size > 1` is supported for ragged references.** Keep `buckets: true` so
-  targets in a batch have one H×W. Reference count and each reference H×W may differ
-  freely. The B>1 path requires FlashAttention-4; batch size 1 keeps the normal PyTorch
-  SDPA path and does not require it.
+`buckets: true` is required for ragged B>1 edit batches. It aligns **target** H×W
+within each batch; it does not resize conditioning images to targets. Configure the
+dataset resolution/buckets separately to bound target-image pixels.
 
-## The recipe, in short
+## Important constraints
 
-- **Grounded text encoding** — each reference image is fed to the Qwen3-VL text
-  encoder alongside the instruction. Its image-patch hidden states are removed before
-  the resulting context reaches the DiT, so the DiT receives only language-token states
-  that have already been grounded by the VLM. Grounding resolution is jittered per step
-  for scale robustness. **The released LoRAs trained at max 768 / jitter min 384**, which
-  is also what this trainer now uses by default (and matches the inference node's
-  `grounding_px` default of 768) — no env vars needed (run from the ai-toolkit root):
-  ```bash
-  python run.py extensions/krea2_edit/configs/krea2_edit_lora_512.yaml
-  ```
-  The env vars remain as *optional overrides*, e.g. a higher cap (which is **not**
-  what the released weights used, and costs VRAM and step time):
-  ```bash
-  GROUNDING_MAX_PX=1024 GROUNDING_JITTER_MIN=384 python run.py extensions/krea2_edit/configs/krea2_edit_lora_512.yaml
-  ```
-  `GROUNDING_MAX_PX=0` disables the cap entirely (native-resolution grounding) — off
-  the released recipe; the trainer warns when you do it.
-  **Stale-cache caveat:** ai-toolkit's text-embedding cache key does not include the
-  grounding settings. If you are training with `cache_text_embeddings: true` and you
-  change `GROUNDING_MAX_PX` / `GROUNDING_JITTER_MIN`, delete the `_t_e_cache` folders
-  in your dataset directories first — otherwise the run silently reuses embeddings
-  built at the old grounding resolution.
-- **Independent patch-aligned reference grids** — each source gets RoPE coordinates
-  `(frame=i+1, h=0..Hr-1, w=0..Wr-1)`. It is never cropped, target-fitted, or
-  center-offset. H and W are independently resized to the nearest 16-pixel lattice
-  for VAE/DiT patch alignment.
-  This requires a newly trained LoRA; it is not compatible with released fit/crop
-  weights.
-- **Arbitrary target grids** — target H×W remains independent of every reference and
-  is represented directly by Krea2's RoPE grid; set ai-toolkit's normal target
-  resolution/bucket policy for training. At inference the paired
-  `Krea2EditEmptyLatent` / `Krea2EditVAEDecode` nodes round any requested pixel
-  output H×W to their nearest 16px-aligned size.
-- **Separate reference time** — source latent tokens are clean and receive the DiT's
-  `t=0` AdaLN modulation; noisy target tokens (and text) receive the sampled flow time.
-  The implementation keeps the two modulation vectors as a small batch-concatenated
-  pair, while attention still runs across the complete reference/target sequence.
-- **Ragged reference batching** — the extension installs an edit-only ai-toolkit
-  collator which moves raw controls from `control_tensor` to one
-  `control_tensor_list` per sample before the stock `torch.cat` path runs. For B>1,
-  the main DiT packs `[text | refs | target]` for all samples with `cu_seqlens` and
-  calls FlashAttention-4 varlen attention. There are no padded reference/image tokens.
-- **Weighted flow-matching** — `timestep_type: "weighted"`: uniform timestep sampling
-  with a per-timestep loss weight table.
-- **Two-stage training works well**: a bulk skill/identity stage at 512, then a short
-  finishing pass at 1024 warm-started from the best 512 checkpoint
-  (`network.pretrained_lora_path`). Merging nearby checkpoints from the finishing
-  stage often beats any single one.
-- Rank: useful capacity saturates well below what you might expect — r64–128 is a
-  good default; go higher only if you measure a reason to.
-- **`model_kwargs: {checkpoint_every_n: N}`** — selective gradient checkpointing:
-  with `train.gradient_checkpointing: true`, only every *N*th transformer block is
-  recomputed instead of all of them, buying step time back for VRAM. `1` (the
-  default) checkpoints every block — lowest VRAM, slowest. `2`–`4` is the useful
-  range if you have headroom on the VRAM table below; the trainer prints how many
-  blocks it ended up checkpointing at load.
-- **`train.unload_text_encoder` must stay false.** The text encoder *is* the grounding
-  path here; with it unloaded and nothing cached, ai-toolkit substitutes a blank
-  embedding on every step and the run trains on no conditioning at all. The trainer
-  raises at startup rather than let that happen.
+- Target latents are still dense `(B, C, H, W)`, because ai-toolkit's scheduler and
+  flow-matching loss are dense. Fully ragged target output sizes in one batch are not
+  supported.
+- Do not mix edit examples and targets-only/T2I examples in the same batch. Keep them
+  in separate datasets or batches.
+- Keep `flip_x` and `flip_y` disabled for edit datasets. ai-toolkit augments targets
+  but does not apply the identical flip to raw references.
+- Keep `train.unload_text_encoder: false`; Qwen3-VL is the grounding path.
+- In-training previews are disabled. Use the paired ComfyUI nodes to evaluate saved
+  LoRAs with the actual reference-conditioned architecture.
 
-### Not supported
+## Compatibility
 
-These are refused with a clear error rather than silently training a LoRA the
-inference nodes cannot reproduce:
-
-- **In-training sample previews** for the edit arch. ai-toolkit's sampling path
-  renders the inherited plain-T2I pipeline (no reference tokens, no image-grounded
-  text encode), so previews would not show what the LoRA actually does. Use
-  `train: { disable_sampling: true }` and evaluate checkpoints in ComfyUI.
-- **Mixed target grids in one batch.** ai-toolkit's flow-matching/noise/loss path is
-  dense `(B,C,H,W)`, so set `buckets: true` for every edit dataset when
-  `batch_size > 1`. This restriction applies to targets only; references are ragged.
-- **B>1 ragged training without FlashAttention-4.** The packed DiT path deliberately
-  has no padded-SDPA fallback. Install `flash-attn-4` on Hopper/Blackwell, or use
-  `batch_size: 1` (regular SDPA).
-- **Reference count is bounded by context length and VRAM.** Every reference adds a
-  full VAE token grid and Qwen3-VL vision block. Start with a small number and avoid
-  high-resolution references unless you have measured the resulting memory use.
-- **Flip augmentation with patch-aligned reference grids** (`flip_x` / `flip_y` on a dataset).
-  ai-toolkit flips the target image but *not* the raw control images, silently
-  desyncing every flipped pair. Keep both false, or pre-flip pairs offline (flipping
-  target *and* source together, as a separate dataset folder).
-- **Unpaired targets in an edit dataset.** A target with no stem-matched source trains
-  as plain T2I with no warning; the startup audit refuses to start and names the
-  offending files.
-- **`train.unload_text_encoder: true`** — the grounding encode needs the text encoder
-  resident; without it ai-toolkit trains on blank embeddings.
-
-All of these are checked in the model constructor, i.e. before the base weights and
-caches load, so a bad config fails in seconds rather than after a long warm-up.
-
-## VRAM: measured requirements — read before filing an issue
-
-These are **measured peak CUDA allocations** (fp8-quantized base + fp8 TE, batch 1,
-gradient checkpointing, latent caching on, text embeddings NOT cached — i.e. the full
-recipe with per-step grounding jitter, everything resident). Your card needs the peak
-plus ~1–2 GB driver/display overhead.
-
-| Config | Peak alloc | Fits on |
-|---|---:|---|
-| r64 @512 | **28.1 GB** | 32 GB cards, comfortably |
-| r128 @512 | **32.0 GB** | does NOT fit 32 GB as-is — use 8-bit AdamW (~29 GB) or cached embeddings |
-| r64 @768 | **30.9 GB** | 32 GB cards, tight (leave headroom: headless card recommended) |
-| r16 @512, full bf16 (no quant) | 42.1 GB | reference worst case |
-
-Field cross-check: independent beta testing on a 32 GB card (r128 @512, uncached)
-read 31.3 GB and fell into PCIe offload — matching the table.
-
-**What this means per card:**
-
-- **32 GB**: the sweet spot. r64 @512 uncached runs the full recipe. r128 wants 8-bit
-  AdamW or cached embeddings.
-- **24 GB**: only with **cached text embeddings** (`cache_text_embeddings: true`),
-  which evicts the 4 GB TE and lands ~24 GB — borderline, and caching freezes ONE
-  grounding scale, trading away the scale-robustness the jitter provides. A
-  multi-scale grounding cache that removes this tradeoff is planned for a follow-up
-  release. The cache key ignores the grounding env vars — delete the dataset
-  `_t_e_cache` folders after changing `GROUNDING_MAX_PX` / `GROUNDING_JITTER_MIN`.
-- **16 GB**: **not supported today.** Please don't file issues asking why 1024
-  training OOMs on 16 GB — the base model alone is 13 GB quantized. The planned
-  grounding-cache mode plus aggressive settings may eventually enable 512px here.
-- **1024px training**: not a consumer-card recipe. Expect it to exceed 32 GB
-  even quantized. The shipped models did the bulk of their training at 512 and used
-  1024 only for a short finishing pass — do that pass on rented hardware (an A6000/
-  L40S-class 48 GB card or better).
-
-**Troubleshooting install/env issues (found the hard way):**
-
-- Install ai-toolkit's own `requirements.txt` exactly. A stale `diffusers` breaks
-  aitk's *built-in* extensions with an opaque `Error running on_error` crash before
-  this extension even loads.
-- `adamw8bit` requires a bitsandbytes build matching your CUDA; if bnb prints a
-  library-load error at startup it is harmless *unless* you selected an 8-bit
-  optimizer — then switch to `adamw`.
-
-Example configs are in `configs/`. Values in them (steps, repeats, learning rate)
-are **generic starting points** — tune for your dataset.
-
-## License / credits
-
-Apache-2.0. `krea2_edit/src/` contains code vendored/adapted from the reference
-implementation in [krea-ai/krea-2](https://github.com/krea-ai/krea-2) (Apache-2.0) —
-see NOTICE. Krea 2 RAW **weights** are separately licensed under the Krea 2 Community
-License (gated); this repo ships no weights.
+This project is intentionally a separate architecture from the upstream trainer and
+from ai-toolkit's built-in Krea 2 edit mode. Do not expect its LoRAs, position layout,
+or reference geometry to interchange with this repository.

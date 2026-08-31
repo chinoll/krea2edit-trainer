@@ -91,6 +91,10 @@ def install_ragged_control_collator():
 # grounding, which is NOT what the released weights were trained with).
 GROUNDING_MAX_PX_DEFAULT = "768"
 GROUNDING_JITTER_MIN_DEFAULT = "384"
+# Appearance inputs can be much larger than the VLM grounding image. Cap each image
+# before VAE encoding so one accidental 6K input cannot dominate a ragged sequence.
+# ``0`` explicitly preserves native-resolution behaviour.
+MAX_IMAGE_PIXELS_DEFAULT = "1048576"
 
 
 def grounding_settings():
@@ -99,6 +103,30 @@ def grounding_settings():
         int(os.environ.get("GROUNDING_MAX_PX", GROUNDING_MAX_PX_DEFAULT)),
         int(os.environ.get("GROUNDING_JITTER_MIN", GROUNDING_JITTER_MIN_DEFAULT)),
     )
+
+
+def max_image_pixels_settings(model_kwargs) -> int:
+    """Resolve the per-image pixel budget (0 means no downscale cap)."""
+    raw = model_kwargs.get(
+        "max_image_pixels",
+        os.environ.get("KREA2_EDIT_MAX_IMAGE_PIXELS", MAX_IMAGE_PIXELS_DEFAULT),
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "krea2_edit: model_kwargs.max_image_pixels must be a non-negative integer"
+        ) from exc
+    if value < 0:
+        raise ValueError(
+            "krea2_edit: model_kwargs.max_image_pixels must be >= 0 (0 disables the cap)"
+        )
+    if 0 < value < 16 * 16:
+        raise ValueError(
+            "krea2_edit: model_kwargs.max_image_pixels must be 0 or at least 256 "
+            "(one 16px VAE/DiT pixel grid)"
+        )
+    return value
 
 
 def _img_tokens_and_pos(latent: torch.Tensor, patch: int, frame: int):
@@ -180,7 +208,7 @@ def predict_velocity_edit_varlen(
     t: torch.Tensor,
     context: Sequence[torch.Tensor],
 ) -> torch.Tensor:
-    """FA4-packed edit prediction for B>1 samples with ragged references.
+    """Packed FA2/FA4 edit prediction for B>1 samples with ragged references.
 
     The target remains a normal bucketed ``(B,C,H,W)`` tensor because ai-toolkit's
     noise scheduler and flow-matching loss are dense.  References are deliberately
@@ -275,11 +303,14 @@ class Krea2EditModel(Krea2Model):
         # cropped or target-fitted; it is resized by at most half a patch per axis to
         # the nearest VAE/DiT 16px lattice before latent patchification.
         model_kwargs = model_config.model_kwargs or {}
+        self.max_image_pixels = max_image_pixels_settings(model_kwargs)
         self.use_raw_control_images = True
         if "fit_refs" in model_kwargs:
             print("[krea2_edit] NOTE: model_kwargs.fit_refs is obsolete and ignored; "
                   "references now use independent patch-aligned grids (no crop).")
         print("[krea2_edit] PATCH-ALIGNED refs ENABLED (independent RoPE grids; nearest-16px resize)")
+        print(f"[krea2_edit] per-image pixel budget: {self.max_image_pixels or 'off'} "
+              "(max_image_pixels; aspect-preserving downscale before VAE)")
         # Grounding policy, printed once so every run is self-documenting.
         _g_max, _g_jit = grounding_settings()
         print(f"[krea2_edit] grounding: GROUNDING_MAX_PX={_g_max} GROUNDING_JITTER_MIN={_g_jit} "
@@ -421,7 +452,7 @@ class Krea2EditModel(Krea2Model):
                     )
                 print(
                     f"[krea2_edit] batch_size={batch_size}: ragged reference mode ENABLED "
-                    "(FlashAttention-4 varlen; target grids must be bucketed)",
+                    "(FlashAttention FA2/FA4 varlen; target grids must be bucketed)",
                     flush=True,
                 )
             flipped = [
@@ -564,17 +595,35 @@ class Krea2EditModel(Krea2Model):
         return tokenizer, processor, text_encoder
 
     # --- appearance path: stash the source latent for the prediction step ---
-    @staticmethod
-    def _resize_reference_to_grid(c):
+    def _resize_reference_to_pixel_budget(self, c):
+        """Downscale only oversized references while preserving their aspect ratio."""
+        max_pixels = self.max_image_pixels
+        h, w = c.shape[-2:]
+        if max_pixels <= 0 or h * w <= max_pixels:
+            return c
+        scale = (max_pixels / float(h * w)) ** 0.5
+        resized_h = max(1, round(h * scale))
+        resized_w = max(1, round(w * scale))
+        return F.interpolate(c, size=(resized_h, resized_w), mode="bilinear", align_corners=False)
+
+    def _resize_reference_to_grid(self, c):
         """Resize a reference to the nearest VAE / DiT patch grid.
 
         Krea's VAE is /8 and the DiT patch is 2x2 latent cells, so each source image
         must be divisible by 16 px. Resize H and W independently to the closest grid
         (rather than padding or cropping) and retain the source's own RoPE origin.
         """
+        c = self._resize_reference_to_pixel_budget(c)
         h, w = c.shape[-2:]
         aligned_h = max(16, ((h + 8) // 16) * 16)
         aligned_w = max(16, ((w + 8) // 16) * 16)
+        # Nearest-grid rounding can nudge an image a few pixels above its budget.
+        # Round down one or both axes in that case so ``max_image_pixels`` is a
+        # real ceiling, not merely an approximate pre-alignment target.
+        if self.max_image_pixels and aligned_h * aligned_w > self.max_image_pixels:
+            scale = (self.max_image_pixels / float(aligned_h * aligned_w)) ** 0.5
+            aligned_h = max(16, int(aligned_h * scale) // 16 * 16)
+            aligned_w = max(16, int(aligned_w * scale) // 16 * 16)
         if (aligned_h, aligned_w) != (h, w):
             c = F.interpolate(c, size=(aligned_h, aligned_w), mode="bilinear",
                               align_corners=False)
@@ -708,7 +757,7 @@ class Krea2EditModel(Krea2Model):
         )
 
         # A single-item ragged DTO can retain the established SDPA path. It avoids
-        # imposing FlashAttention-4 as a dependency on ordinary batch_size: 1 runs.
+        # imposing a FlashAttention dependency on ordinary batch_size: 1 runs.
         if ragged_controls:
             src = [s.to(self.device_torch, self.torch_dtype) for s in self._control_latents[0]]
             return predict_velocity_edit(m, li, src, t, context, text_mask)
@@ -798,6 +847,9 @@ class Krea2EditModel(Krea2Model):
         from PIL import Image
         import numpy as np
         import random
+        # Apply the appearance-path budget here too, before the separate VLM grounding
+        # cap/jitter. This keeps both branches derived from the same bounded source.
+        image = self._resize_reference_to_pixel_budget(image.unsqueeze(0)).squeeze(0)
         arr = (image.detach().float().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
         pil = Image.fromarray(arr.transpose(1, 2, 0))
         cap, jmin = grounding_settings()

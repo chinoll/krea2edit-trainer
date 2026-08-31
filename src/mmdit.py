@@ -11,7 +11,7 @@ Differences from the reference (all training-driven, numerically equivalent):
     LoRA module swapping and variable shapes during training).
   - Regular attention uses ``F.scaled_dot_product_attention`` instead of forcing
     the cuDNN SDPA backend, so it works across dtypes / masks / backward. Ragged
-    B>1 edit batches use FlashAttention-4's packed varlen API instead.
+    B>1 edit batches use FlashAttention-2/4 packed varlen attention instead.
   - ``enable_gradient_checkpointing`` / ``disable_gradient_checkpointing`` and a
     per-block ``torch.utils.checkpoint`` wrapper are added (gated on
     ``torch.is_grad_enabled()`` so eval/sampling never pays for it).
@@ -64,40 +64,15 @@ def ropeapply_packed(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Ten
     return xq_.reshape(*xq.shape).to(xq.dtype), xk_.reshape(*xk.shape).to(xk.dtype)
 
 
-def flash_attention4_varlen(
+def _flash_attention4_varlen(
     q: Tensor,
     k: Tensor,
     v: Tensor,
     cu_seqlens: Tensor,
     max_seqlen: int,
 ) -> Tensor:
-    """FlashAttention-4 unpadded self-attention with one sequence per sample.
-
-    FA4 is intentionally required for the ragged training path.  Falling back to
-    padding + SDPA would defeat the point of variable-length source grids and can
-    turn a single large reference into an O(B * L^2) allocation.  FA4 currently
-    requires a Hopper/Blackwell CUDA GPU and the ``flash-attn-4`` package.
-    """
-    if not q.is_cuda:
-        raise RuntimeError(
-            "krea2_edit ragged training requires CUDA FlashAttention-4; "
-            "the packed attention tensors are on CPU."
-        )
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise RuntimeError(
-            "krea2_edit ragged training requires fp16 or bf16 Q/K/V for FlashAttention-4; "
-            f"got {q.dtype}."
-        )
-    try:
-        from flash_attn.cute import flash_attn_varlen_func
-    except ImportError as exc:
-        raise RuntimeError(
-            "krea2_edit ragged training needs FlashAttention-4. Install it with "
-            "`pip install flash-attn-4` (or `flash-attn-4[cu13]` for CUDA 13) on "
-            "a Hopper/Blackwell GPU. batch_size: 1 still uses the normal SDPA path."
-        ) from exc
-
-    cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
+    """Invoke the FA4 CUTE varlen API (Hopper/Blackwell)."""
+    from flash_attn.cute import flash_attn_varlen_func
     try:
         return flash_attn_varlen_func(
             q.contiguous(), k.contiguous(), v.contiguous(),
@@ -120,6 +95,76 @@ def flash_attention4_varlen(
                 "Installed FlashAttention-4 does not expose the expected "
                 "flash_attn_varlen_func API. Upgrade with `pip install -U flash-attn-4`."
             ) from exc
+
+
+def _flash_attention2_varlen(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+) -> Tensor:
+    """Invoke the FlashAttention-2 varlen API (Ampere/Ada/Hopper)."""
+    from flash_attn import flash_attn_varlen_func
+    return flash_attn_varlen_func(
+        q.contiguous(), k.contiguous(), v.contiguous(),
+        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+        dropout_p=0.0, causal=False,
+    )
+
+
+def flash_attention_varlen(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+) -> Tensor:
+    """Select FA2/FA4 varlen attention from the CUDA architecture.
+
+    A100/A800 (SM80) use FA2. Hopper and newer (SM90+) prefer FA4; if FA4 is
+    absent, FA2 is tried as a compatible fallback where the installed build supports
+    that GPU. There is deliberately no padded-SDPA fallback for ragged B>1 inputs.
+    """
+    if not q.is_cuda:
+        raise RuntimeError("krea2_edit ragged training requires CUDA FlashAttention.")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            "krea2_edit ragged training requires fp16 or bf16 Q/K/V for FlashAttention; "
+            f"got {q.dtype}."
+        )
+    major, minor = torch.cuda.get_device_capability(q.device)
+    arch = f"sm_{major}{minor}"
+    cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
+
+    if major >= 9:
+        try:
+            return _flash_attention4_varlen(q, k, v, cu_seqlens, max_seqlen)
+        except ImportError:
+            # FA2 remains useful on Hopper when a FA4 wheel has not yet been built
+            # for a user's CUDA stack. It is not a padding fallback: it stays varlen.
+            try:
+                return _flash_attention2_varlen(q, k, v, cu_seqlens, max_seqlen)
+            except ImportError as exc:
+                raise RuntimeError(
+                    f"krea2_edit ragged training on {arch} needs FlashAttention-4 "
+                    "(`pip install flash-attn-4`) or a compatible FlashAttention-2 build "
+                    "(`pip install flash-attn`)."
+                ) from exc
+
+    if major == 8:
+        try:
+            return _flash_attention2_varlen(q, k, v, cu_seqlens, max_seqlen)
+        except ImportError as exc:
+            raise RuntimeError(
+                f"krea2_edit ragged training on {arch} (including A100/A800) needs "
+                "FlashAttention-2: `pip install flash-attn`."
+            ) from exc
+
+    raise RuntimeError(
+        f"krea2_edit ragged training needs FlashAttention varlen, but {arch} is unsupported. "
+        "Use an Ampere (A100/A800), Ada, Hopper, or newer NVIDIA GPU, or batch_size: 1."
+    )
 
 
 def attention(
@@ -310,14 +355,14 @@ class Attention(torch.nn.Module):
         cu_seqlens: Tensor,
         max_seqlen: int,
     ) -> Tensor:
-        """Packed FA4 attention for ragged batches (no pad tokens, no mask)."""
+        """Packed FA2/FA4 attention for ragged batches (no pad tokens, no mask)."""
         q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
         q = rearrange(q, "T (H D) -> T H D", H=self.heads)
         k = rearrange(k, "T (H D) -> T H D", H=self.kvheads)
         v = rearrange(v, "T (H D) -> T H D", H=self.kvheads)
         q, k, v = self.qknorm(q, k, v)
         q, k = ropeapply_packed(q, k, freqs)
-        out = flash_attention4_varlen(q, k, v, cu_seqlens, max_seqlen)
+        out = flash_attention_varlen(q, k, v, cu_seqlens, max_seqlen)
         out = rearrange(out, "T H D -> T (H D)")
         return self.wo(out * F.sigmoid(gate))
 
@@ -728,7 +773,7 @@ class SingleStreamDiT(nn.Module):
         image_positions: list[Tensor],
         ref_token_counts: list[int],
     ) -> list[Tensor]:
-        """Run the DiT over a ragged batch with FlashAttention-4 varlen kernels.
+        """Run the DiT over a ragged batch with FlashAttention-2/4 varlen kernels.
 
         Each element describes exactly one independent sequence:
         ``[text_i | ref_1_i | ... | ref_N_i | target_i]``.  Only the main
@@ -770,7 +815,7 @@ class SingleStreamDiT(nn.Module):
                 raise ValueError("varlen text context must be (L_text, selected_layers, hidden)")
 
             # Keeping B=1 here avoids padding variable VLM-language contexts. It is
-            # only four small text blocks; the 48 DiT blocks below use packed FA4.
+            # only four small text blocks; the 48 DiT blocks below use packed FA2/FA4.
             txt = self.txtmlp(self.txtfusion(ctx.unsqueeze(0), mask=None).squeeze(0))
             img = self.first(img)
             txt_len, img_len = txt.shape[0], img.shape[0]
