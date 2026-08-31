@@ -157,6 +157,48 @@ model:
 within each batch; the same per-image cap is applied to every target before the batch
 is stacked. It does not resize conditioning images to target geometry.
 
+## In-training edit previews
+
+Previews use the real edit path: reference images are encoded by both Qwen3-VL and
+the VAE, reference DiT tokens remain clean at `t=0`, and only the target starts from
+noise. AI-Toolkit still controls `sample_every`, seeds, saving, and logging.
+
+The recommended setup reuses the training manifest. Add its path to `model_kwargs`,
+then put manifest sample IDs (not captions) in `sample.samples[].prompt`:
+
+```yaml
+train:
+  disable_sampling: false
+
+model:
+  model_kwargs:
+    text_encoder_path: Qwen/Qwen3-VL-4B-Instruct
+    max_image_pixels: 1048576
+    preview_manifest: data/my_dataset/manifest.jsonl
+
+sample:
+  sample_every: 250
+  sample_steps: 20
+  guidance_scale: 4.5
+  samples:
+    - prompt: scene-subject-0001
+      width: 512
+      height: 512
+      seed: 42
+    - prompt: subject-only-0002
+      width: 512
+      height: 768
+      seed: 43
+```
+
+This supports every reference count and preserves the manifest's explicit frame IDs.
+For a quick preview without a manifest, `ctrl_img_1`, `ctrl_img_2`, and `ctrl_img_3`
+also work, with contiguous frames `1..N`.
+
+Each saved sample is a comparison sheet: the edit prompt is rendered above
+`[input reference montage | output image]`. Keep seeds fixed to compare the same
+examples across checkpoints.
+
 ## Important constraints
 
 - Target latents are still dense `(B, C, H, W)`, because ai-toolkit's scheduler and
@@ -167,8 +209,8 @@ is stacked. It does not resize conditioning images to target geometry.
 - Keep `flip_x` and `flip_y` disabled for edit datasets. ai-toolkit augments targets
   but does not apply the identical flip to raw references.
 - Keep `train.unload_text_encoder: false`; Qwen3-VL is the grounding path.
-- In-training previews are disabled. Use the paired ComfyUI nodes to evaluate saved
-  LoRAs with the actual reference-conditioned architecture.
+- Preview prompt embeddings are recomputed from the reference images at every sample
+  event; cached text-only sample embeddings are intentionally not used.
 
 ## Compatibility
 

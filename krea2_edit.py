@@ -20,13 +20,15 @@ import torch
 import torch.nn.functional as F
 from typing import TYPE_CHECKING, List, Optional, Sequence
 from einops import rearrange, repeat
+from diffusers.utils.torch_utils import randn_tensor
+from PIL import Image as PILImage
 
 from toolkit.config_modules import ModelConfig
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 
 from .krea2 import Krea2Model
 from .src.mmdit import SingleStreamDiT
-from .src.pipeline import pad_text_features, predict_velocity
+from .src.pipeline import pad_text_features, predict_velocity, timesteps
 from .src.text_encoder import (
     SELECT_LAYERS,
     PROMPT_TEMPLATE_ENCODE_PREFIX,
@@ -86,6 +88,7 @@ def prepare_manifest_dataset(dataset_config) -> bool:
 
     entries: dict[str, dict] = {}
     captions: dict[str, dict] = {}
+    seen_sample_ids = set()
     raw = manifest_path.read_bytes()
     for line_num, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
         if not line.strip():
@@ -99,6 +102,11 @@ def prepare_manifest_dataset(dataset_config) -> bool:
         sample_id = record.get("id")
         if not isinstance(sample_id, str) or not sample_id:
             raise ValueError(f"krea2_edit manifest line {line_num}: missing non-empty sample id")
+        if sample_id in seen_sample_ids:
+            raise ValueError(
+                f"krea2_edit manifest line {line_num}: duplicate sample id: {sample_id}"
+            )
+        seen_sample_ids.add(sample_id)
         target = record.get("target")
         target_image = target.get("image") if isinstance(target, dict) else target
         target_path = _manifest_resolve_path(manifest_path.parent, target_image, "target.image", line_num)
@@ -139,8 +147,14 @@ def prepare_manifest_dataset(dataset_config) -> bool:
                 ),
             })
         parsed_refs.sort(key=lambda ref: ref["frame"])
-        entries[key] = {"id": sample_id, "references": parsed_refs}
-        captions[target_path] = {"caption": _manifest_caption(record, line_num)}
+        caption = _manifest_caption(record, line_num)
+        entries[key] = {
+            "id": sample_id,
+            "target": target_path,
+            "caption": caption,
+            "references": parsed_refs,
+        }
+        captions[target_path] = {"caption": caption}
 
     if not entries:
         raise ValueError(f"krea2_edit manifest has no samples: {manifest_path}")
@@ -168,6 +182,22 @@ def prepare_manifest_datasets(dataset_configs):
     count = sum(prepare_manifest_dataset(dataset) for dataset in dataset_configs)
     if count:
         print(f"[krea2_edit] manifest-first datasets ENABLED ({count} JSONL manifest(s))")
+
+
+def load_preview_manifest(path: str) -> dict[str, dict]:
+    """Load a training manifest as an ID-addressable preview specification."""
+    class PreviewDatasetConfig:
+        dataset_path = path
+        folder_path = None
+        control_path = None
+
+    config = PreviewDatasetConfig()
+    if not prepare_manifest_dataset(config):
+        raise ValueError("krea2_edit: model_kwargs.preview_manifest must be a .jsonl file")
+    return {
+        entry["id"]: entry
+        for entry in config.krea2edit_manifest_entries.values()
+    }
 
 
 def krea2_edit_ragged_collation(batch):
@@ -546,6 +576,125 @@ def predict_velocity_edit_varlen(
     return torch.stack(velocities, dim=0).to(target_latents.dtype)
 
 
+class Krea2EditPipeline:
+    """Reference-conditioned flow sampler used for in-training previews."""
+
+    def __init__(self, model):
+        self.model = model
+
+    @property
+    def device(self):
+        return self.model.device_torch
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def set_progress_bar_config(self, **kwargs):
+        pass
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        conditional_embeds,
+        unconditional_embeds,
+        source_latents: Sequence[torch.Tensor],
+        reference_frames: Optional[Sequence[int]] = None,
+        height: int = 1024,
+        width: int = 1024,
+        num_inference_steps: int = 28,
+        guidance_scale: float = 4.5,
+        latents: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+        **kwargs,
+    ) -> List[PILImage.Image]:
+        if not source_latents:
+            raise ValueError("krea2_edit preview requires at least one reference latent")
+
+        model = self.model
+        device = model.device_torch
+        dtype = model.torch_dtype
+        transformer: SingleStreamDiT = model.transformer
+        patch = model.patch_size
+        ae_scale = model.vae_scale_factor
+        reference_frames = list(reference_frames or range(1, len(source_latents) + 1))
+
+        model_kwargs = model.model_config.model_kwargs
+        y1 = float(model_kwargs.get("schedule_y1", 0.5))
+        y2 = float(model_kwargs.get("schedule_y2", 1.15))
+        minres = int(model_kwargs.get("schedule_min_res", 256))
+        maxres = int(model_kwargs.get("schedule_max_res", 1280))
+        mu = model_kwargs.get("schedule_mu", None)
+        mu = float(mu) if mu is not None else None
+
+        do_cfg = guidance_scale > 0 and unconditional_embeds is not None
+        grid_h = height // (ae_scale * patch)
+        grid_w = width // (ae_scale * patch)
+        latent_channels = transformer.config.channels
+        if latents is None:
+            latents = randn_tensor(
+                (1, latent_channels, height // ae_scale, width // ae_scale),
+                generator=generator,
+                device=device,
+                dtype=torch.float32,
+            )
+        latents = latents.to(device, dtype=torch.float32)
+        references = [reference.to(device, dtype=dtype) for reference in source_latents]
+
+        conditional_features, conditional_mask = pad_text_features(
+            conditional_embeds.text_embeds, device, dtype
+        )
+        if do_cfg:
+            unconditional_features, unconditional_mask = pad_text_features(
+                unconditional_embeds.text_embeds, device, dtype
+            )
+
+        alignment = ae_scale * patch
+        schedule = timesteps(
+            grid_h * grid_w,
+            num_inference_steps,
+            (minres // alignment) ** 2,
+            (maxres // alignment) ** 2,
+            y1=y1,
+            y2=y2,
+            mu=mu,
+        )
+        for current_t, previous_t in zip(schedule[:-1], schedule[1:]):
+            timestep = torch.full(
+                (latents.shape[0],), current_t, dtype=dtype, device=device
+            )
+            conditional_velocity = predict_velocity_edit(
+                transformer,
+                latents.to(dtype),
+                references,
+                timestep,
+                conditional_features,
+                conditional_mask,
+                reference_frames,
+            )
+            if do_cfg:
+                unconditional_velocity = predict_velocity_edit(
+                    transformer,
+                    latents.to(dtype),
+                    references,
+                    timestep,
+                    unconditional_features,
+                    unconditional_mask,
+                    reference_frames,
+                )
+                velocity = conditional_velocity + guidance_scale * (
+                    conditional_velocity - unconditional_velocity
+                )
+            else:
+                velocity = conditional_velocity
+            latents = latents + (previous_t - current_t) * velocity.to(torch.float32)
+
+        images = model.decode_latents(latents, device=device, dtype=dtype)
+        images = images.float().clamp(-1.0, 1.0)
+        images = ((images + 1.0) * 127.5).round().to(torch.uint8)
+        images = images.permute(0, 2, 3, 1).cpu().numpy()
+        return [PILImage.fromarray(image) for image in images]
+
+
 class Krea2EditModel(Krea2Model):
     arch = "krea2_edit"
 
@@ -560,6 +709,17 @@ class Krea2EditModel(Krea2Model):
         # cropped or target-fitted; it is resized by at most half a patch per axis to
         # the nearest VAE/DiT 16px lattice before latent patchification.
         model_kwargs = model_config.model_kwargs or {}
+        self._sample_reference_images = None
+        self._sample_reference_frames = None
+        self._sampling_preview_active = False
+        self._preview_manifest_samples = {}
+        preview_manifest = model_kwargs.get("preview_manifest", None)
+        if preview_manifest:
+            self._preview_manifest_samples = load_preview_manifest(str(preview_manifest))
+            print(
+                f"[krea2_edit] preview manifest ENABLED "
+                f"({len(self._preview_manifest_samples)} sample IDs): {preview_manifest}"
+            )
         process = self._find_owning_train_process()
         if process is not None:
             prepare_manifest_datasets(list(getattr(process, "dataset_configs", None) or []))
@@ -818,23 +978,172 @@ class Krea2EditModel(Krea2Model):
             )
 
     # ------------------------------------------------------------------
-    # In-training previews: unsupported for the edit arch
+    # Reference-conditioned in-training previews
     # ------------------------------------------------------------------
-    _NO_SAMPLING_MSG = (
-        "krea2_edit: in-training sample previews are not supported for this architecture.\n"
-        "  ai-toolkit's sampling path renders the inherited plain-T2I pipeline: no "
-        "reference token blocks (frame>=1) and no image-grounded Qwen3-VL encode, so the "
-        "previews show what the LoRA does WITHOUT the edit conditioning — misleading at "
-        "best.\n"
-        "  Set train.disable_sampling: true and evaluate checkpoints in ComfyUI with the "
-        "comfyui-krea2edit nodes."
-    )
-
     def get_generation_pipeline(self):
-        raise NotImplementedError(self._NO_SAMPLING_MSG)
+        return Krea2EditPipeline(self)
 
-    def generate_single_image(self, *args, **kwargs):
-        raise NotImplementedError(self._NO_SAMPLING_MSG)
+    def generate_images(self, *args, **kwargs):
+        """Use ai-toolkit's orchestration but force fresh multimodal prompt embeds."""
+        cached_prompts = self.sample_prompts_cache
+        self.sample_prompts_cache = None
+        try:
+            return super().generate_images(*args, **kwargs)
+        finally:
+            self.sample_prompts_cache = cached_prompts
+            self._clear_sample_prompt_context()
+
+    def _clear_sample_prompt_context(self):
+        self._sample_reference_images = None
+        self._sample_reference_frames = None
+        self._sampling_preview_active = False
+
+    @staticmethod
+    def _sample_control_paths(gen_config) -> List[str]:
+        """Read ai-toolkit's native 1-3 control fields without alias duplicates."""
+        paths, seen = [], set()
+        for field in ("ctrl_img", "ctrl_img_1", "ctrl_img_2", "ctrl_img_3"):
+            value = getattr(gen_config, field, None)
+            if not value:
+                continue
+            path = str(Path(str(value)).resolve())
+            key = _manifest_path_key(path)
+            if key not in seen:
+                paths.append(path)
+                seen.add(key)
+        return paths
+
+    def prepare_sample_prompt_context(self, gen_config):
+        """Resolve one preview's prompt, reference images, and stable RoPE frames."""
+        self._clear_sample_prompt_context()
+        native_paths = self._sample_control_paths(gen_config)
+
+        if self._preview_manifest_samples:
+            sample_id = str(gen_config.prompt).strip()
+            entry = self._preview_manifest_samples[sample_id]
+            references = entry["references"]
+            paths = [reference["image"] for reference in references]
+            frames = [int(reference["frame"]) for reference in references]
+            gen_config.prompt = entry["caption"]
+            gen_config.prompt_2 = entry["caption"]
+            display_name = sample_id
+        else:
+            paths = native_paths
+            frames = list(range(1, len(paths) + 1))
+            display_name = str(gen_config.prompt)
+
+        if not paths:
+            raise ValueError("krea2_edit preview requires at least one reference image")
+
+        from torchvision.transforms import functional as TF
+
+        images = []
+        for path in paths:
+            with PILImage.open(path) as image:
+                images.append(TF.to_tensor(image.convert("RGB")))
+        self._sample_reference_images = images
+        self._sample_reference_frames = frames
+        self._sampling_preview_active = True
+        print(
+            f"[krea2_edit] preview '{display_name}': refs={len(images)} "
+            f"frames={frames} output={gen_config.width}x{gen_config.height}"
+        )
+
+    @staticmethod
+    def _render_preview_sheet(reference_images, output: PILImage.Image, prompt: str):
+        """Render `[input references | output]` with the edit prompt above it."""
+        import math
+        import textwrap
+        from PIL import ImageDraw, ImageFont, ImageOps
+
+        output = output.convert("RGB")
+        panel_size = output.size
+        input_panel = PILImage.new("RGB", panel_size, (24, 24, 24))
+        columns = max(1, math.ceil(math.sqrt(len(reference_images))))
+        rows = math.ceil(len(reference_images) / columns)
+        cell_width = panel_size[0] // columns
+        cell_height = panel_size[1] // rows
+        for index, tensor in enumerate(reference_images):
+            array = (tensor.clamp(0, 1).mul(255).byte().permute(1, 2, 0).numpy())
+            image = PILImage.fromarray(array)
+            image = ImageOps.contain(image, (cell_width, cell_height))
+            x = (index % columns) * cell_width + (cell_width - image.width) // 2
+            y = (index // columns) * cell_height + (cell_height - image.height) // 2
+            input_panel.paste(image, (x, y))
+
+        body = PILImage.new("RGB", (panel_size[0] * 2, panel_size[1]), "black")
+        body.paste(input_panel, (0, 0))
+        body.paste(output, (panel_size[0], 0))
+
+        font_size = max(18, min(32, body.width // 48))
+        font = ImageFont.load_default(size=font_size)
+        lines = textwrap.wrap(
+            str(prompt), width=max(24, int(body.width / (font_size * 0.6)))
+        ) or [""]
+        line_height = font_size + 6
+        header_height = 20 + line_height * len(lines)
+        sheet = PILImage.new("RGB", (body.width, header_height + body.height), "white")
+        ImageDraw.Draw(sheet).multiline_text(
+            (12, 10), "\n".join(lines), fill="black", font=font, spacing=4
+        )
+        sheet.paste(body, (0, header_height))
+        return sheet
+
+    @torch.no_grad()
+    def generate_single_image(
+        self,
+        pipeline: Krea2EditPipeline,
+        gen_config,
+        conditional_embeds: AdvancedPromptEmbeds,
+        unconditional_embeds: AdvancedPromptEmbeds,
+        generator: torch.Generator,
+        extra: dict,
+    ):
+        if not self._sample_reference_images:
+            raise RuntimeError(
+                "krea2_edit preview context was not prepared before generation"
+            )
+        if self.model.device == torch.device("cpu"):
+            self.model.to(self.device_torch)
+
+        divisibility = self.get_bucket_divisibility()
+        gen_config.width = max(
+            divisibility, int(gen_config.width // divisibility * divisibility)
+        )
+        gen_config.height = max(
+            divisibility, int(gen_config.height // divisibility * divisibility)
+        )
+
+        try:
+            source_latents = []
+            for image in self._sample_reference_images:
+                pixels = (image.unsqueeze(0) * 2 - 1).to(
+                    self.vae_device_torch, dtype=self.torch_dtype
+                )
+                pixels = self._resize_reference_to_grid(pixels)
+                source_latents.append(
+                    self.encode_images(pixels).to(
+                        self.device_torch, dtype=self.torch_dtype
+                    )
+                )
+            output = pipeline(
+                conditional_embeds=conditional_embeds,
+                unconditional_embeds=unconditional_embeds,
+                source_latents=source_latents,
+                reference_frames=self._sample_reference_frames,
+                height=gen_config.height,
+                width=gen_config.width,
+                num_inference_steps=gen_config.num_inference_steps,
+                guidance_scale=gen_config.guidance_scale,
+                latents=gen_config.latents,
+                generator=generator,
+                **extra,
+            )[0]
+            return self._render_preview_sheet(
+                self._sample_reference_images, output, gen_config.prompt
+            )
+        finally:
+            self._clear_sample_prompt_context()
 
     def _load_text_encoder(self):
         """Same as Krea2Model but KEEP the Qwen3-VL vision tower.
@@ -1063,6 +1372,8 @@ class Krea2EditModel(Krea2Model):
 
     # --- semantic path: image-grounded Qwen3-VL encode ---
     def get_prompt_embeds(self, prompt, control_images=None) -> "AdvancedPromptEmbeds":
+        if self._sample_reference_images is not None:
+            control_images = self._sample_reference_images
         if control_images is None:
             return super().get_prompt_embeds(prompt)
         if isinstance(prompt, str):
@@ -1143,7 +1454,9 @@ class Krea2EditModel(Krea2Model):
         pil = Image.fromarray(arr.transpose(1, 2, 0))
         cap, jmin = grounding_settings()
         if cap > 0:
-            tgt = random.randint(jmin, cap) if 0 < jmin < cap else cap
+            tgt = cap if self._sampling_preview_active else (
+                random.randint(jmin, cap) if 0 < jmin < cap else cap
+            )
             if max(pil.size) > tgt:
                 s = tgt / max(pil.size)
                 pil = pil.resize(
