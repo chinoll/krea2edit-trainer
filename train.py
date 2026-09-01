@@ -159,6 +159,8 @@ def main():
         global_step = int(Path(resume_from).name.rsplit("-", 1)[-1])
 
     model.train()
+    accumulated_loss = torch.zeros((), device=accelerator.device)
+    accumulated_micro_steps = 0
     while global_step < int(train_config["steps"]):
         for batch in dataloader:
             with accelerator.accumulate(model):
@@ -198,23 +200,38 @@ def main():
                     for prediction, clean, noise in zip(predictions, clean_targets, noises)
                 ]
                 loss = (torch.stack(losses) * loss_weights).mean()
+                accumulated_loss += loss.detach()
+                accumulated_micro_steps += 1
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), float(train_config["max_grad_norm"]))
+                    grad_norm = accelerator.clip_grad_norm_(
+                        model.parameters(), float(train_config["max_grad_norm"])
+                    )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             if accelerator.sync_gradients:
                 global_step += 1
-                mean_loss = accelerator.reduce(loss.detach(), reduction="mean").item()
+                mean_loss = accelerator.reduce(
+                    accumulated_loss / accumulated_micro_steps, reduction="mean"
+                ).item()
+                accumulated_loss.zero_()
+                accumulated_micro_steps = 0
                 accelerator.log(
-                    {"train/loss": mean_loss, "train/lr": scheduler.get_last_lr()[0]},
+                    {
+                        "train/loss": mean_loss,
+                        "train/grad_norm": float(grad_norm),
+                        "train/lr": scheduler.get_last_lr()[0],
+                    },
                     step=global_step,
                 )
                 if global_step % int(train_config["log_every"]) == 0:
-                    accelerator.print(f"step={global_step} loss={mean_loss:.6f}")
+                    accelerator.print(
+                        f"step={global_step} loss={mean_loss:.6f} "
+                        f"grad_norm={float(grad_norm):.6f}"
+                    )
                 if global_step % int(train_config["save_every"]) == 0:
                     save_checkpoint(accelerator, model, output_dir, global_step)
                 if global_step >= int(train_config["steps"]):

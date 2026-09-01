@@ -54,4 +54,4 @@ train:
   resume_from: null
 
 logging:
-  backend: null
+  backend: wandb

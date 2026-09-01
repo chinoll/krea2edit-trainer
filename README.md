@@ -161,6 +161,28 @@ accelerate launch --config_file configs/accelerate_zero2.yaml \
 
 `distributed.deepspeed_zero2: true` 会由训练脚本创建 stage-2 plugin；梯度累积与裁剪直接读取训练 YAML。仓库同时提供原生 [configs/deepspeed_zero2.json](configs/deepspeed_zero2.json)，便于接入已有 DeepSpeed launcher。
 
+## W&B 训练记录
+
+先登录 W&B：
+
+```bash
+wandb login
+```
+
+示例配置默认启用 W&B：
+
+```yaml
+project_name: krea2edit
+
+logging:
+  backend: wandb
+```
+
+`project_name` 是 W&B project 名称。训练器在每次实际 optimizer update 时记录
+梯度累积窗口平均值 `train/loss`、裁剪前 global L2 norm `train/grad_norm` 和
+`train/lr`；micro-step 不会产生重复记录。将 `logging.backend` 改为 `null` 可以
+关闭在线记录。
+
 ## Checkpoint
 
 每次保存会写入：

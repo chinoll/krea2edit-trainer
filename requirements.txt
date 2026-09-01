@@ -1,6 +1,6 @@
 torch>=2.6
 torchvision
-accelerate>=1.6
+accelerate>=1.8
 deepspeed>=0.16
 diffusers>=0.35
 transformers>=4.57
@@ -12,5 +12,6 @@ einops
 Pillow
 PyYAML
 bitsandbytes
+wandb
 # A100/A800/Ada: install flash-attn separately with --no-build-isolation.
 # H100/H200/Blackwell: install flash-attn-4, or a compatible flash-attn build.
