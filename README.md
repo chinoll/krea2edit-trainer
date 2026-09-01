@@ -109,7 +109,8 @@ model:
     text_encoder: none
 ```
 
-两项均支持 `none`、`int4`、`int8`、`float8`。例如只量化 VLM：
+两项均支持 `none`、`int4`、`int8`、`float8`。DIT 还支持下面单独说明的实验性
+`svdquant_dual`。例如只量化 VLM：
 
 ```yaml
 model:
@@ -119,6 +120,63 @@ model:
 ```
 
 DIT 基座先由 Optimum Quanto 量化并冻结，然后 PEFT 在量化 Linear 上挂载 LoRA；TE 只参与无梯度的多模态编码。VAE 保持训练 dtype，不跟随这两个量化开关。
+
+## 实验性双向 SVDQuant
+
+> [!WARNING]
+> 这是实验性训练后端，请谨慎使用。它在 backward 中再次执行 W4A4 量化，得到的
+> `dX` 是近似梯度，尚未经过与默认 BF16/Quanto 路径同等规模的收敛验证。正式长跑
+> 前应先进行短程训练，并对比 loss、gradient norm 和固定 seed 样图；不要直接覆盖
+> 已有稳定训练配置或 checkpoint。
+
+`svdquant_dual` 让同一个 DiT Linear 保存两套 Nunchaku INT4 权重：
+
+```text
+forward: X ── SVDQuant(W) ──> Y
+backward: G ── SVDQuant(W.T) ──> dX
+```
+
+前向和输入梯度都调用 Nunchaku 已有的 W4A4 Linear kernel。DiT 基座冻结，
+所以不会计算 `dW`；PEFT LoRA 的参数梯度仍然使用 BF16 GEMM。该模式同时支持
+普通 3D batch 和 FA2/FA4 使用的 2D packed varlen token。
+
+先按照 [Nunchaku](https://github.com/nunchaku-ai/nunchaku) 官方说明安装与当前
+PyTorch、CUDA 和 GPU 架构匹配的 wheel。A100 使用 INT4 checkpoint。然后把已有
+forward SVDQuant checkpoint 转成训练使用的双向 checkpoint：
+
+```bash
+python train.py \
+  --build-dual-svdquant weights/krea2edit-svdquant-forward.safetensors \
+  --convert-output weights/krea2edit-svdquant-dual.safetensors
+```
+
+输入 checkpoint 中每个 Linear 使用原始 DiT module path，并包含
+`qweight`、`wscales`、`smooth`/`smooth_factor`、
+`lora_down`/`proj_down`、`lora_up`/`proj_up`。转换器会：
+
+1. 还原 forward 主分支的有效权重；
+2. 转置并按 group size 64 重新执行 INT4 RTN；
+3. 将固定 SVD 低秩分支交换方向后按 Nunchaku layout 重新 pack；
+4. 写出 `forward_linear.*` 和 `backward_linear.*` 两套权重。
+
+训练配置：
+
+```yaml
+model:
+  quantization:
+    dit: svdquant_dual
+    text_encoder: int8
+  svdquant_dual:
+    name_or_path: weights/krea2edit-svdquant-dual.safetensors
+    filename: null
+```
+
+只有输入、输出通道均为 128 倍数且出现在 checkpoint 中的 Linear 会被替换；首尾
+小投影保留 BF16。当前实验后端的两个方向都使用 signed INT4 activation；转置
+分支使用 `smooth=1`。
+这会把长期基座存储从单份约 4-bit 增加到双份约 8-bit，但 backward 不再临时
+生成整层 BF16 权重。若已有使用真实 `G=dL/dY` 校准得到的 backward checkpoint，
+也可以直接按相同的 `backward_linear.*` 布局加载，不需要运行上述 RTN 转换。
 
 ## Timestep 采样
 
@@ -225,5 +283,6 @@ train:
 - 独立入口：[train.py](train.py)
 - ragged manifest 数据层：[krea2edit/data.py](krea2edit/data.py)
 - 权重、VLM/VAE、Quanto、PEFT 与 packed model：[krea2edit/modeling.py](krea2edit/modeling.py)
+- 实验性双向 SVDQuant、转置 checkpoint 与 autograd：[krea2edit/svdquant.py](krea2edit/svdquant.py)
 - timestep 策略：[krea2edit/timesteps.py](krea2edit/timesteps.py)
 - DiT 与 FA2/FA4 实现：[krea2edit/mmdit.py](krea2edit/mmdit.py)

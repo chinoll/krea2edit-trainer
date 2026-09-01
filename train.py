@@ -15,11 +15,16 @@ from krea2edit.modeling import (
     ConditioningModels,
     RaggedEditModel,
     add_lora,
+    checkpoint_path,
     export_comfyui_lora,
     load_dit,
     quantize_component,
     target_velocity_tokens,
     torch_dtype,
+)
+from krea2edit.svdquant import (
+    convert_forward_svdquant_checkpoint,
+    load_dual_svdquant_linears,
 )
 from krea2edit.timesteps import sample_timesteps
 
@@ -29,6 +34,7 @@ def parse_args():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--config")
     mode.add_argument("--convert-adapter", type=Path)
+    mode.add_argument("--build-dual-svdquant", type=Path)
     parser.add_argument("--convert-output", type=Path)
     return parser.parse_args()
 
@@ -80,6 +86,13 @@ def main():
         )
         print(output)
         return
+    if args.build_dual_svdquant:
+        output = args.convert_output or args.build_dual_svdquant.with_name(
+            f"{args.build_dual_svdquant.stem}-dual.safetensors"
+        )
+        convert_forward_svdquant_checkpoint(args.build_dual_svdquant, output)
+        print(output)
+        return
 
     config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     train_config = config["train"]
@@ -127,8 +140,20 @@ def main():
 
     dtype = torch_dtype(config["model"]["dtype"])
     dit = load_dit(config["model"]["dit"], dtype)
-    quantize_component(dit, config["model"]["quantization"]["dit"])
-    dit = add_lora(dit, config["lora"])
+    dit_quantization = config["model"]["quantization"]["dit"]
+    dual_svdquant_count = 0
+    if dit_quantization == "svdquant_dual":
+        dit = add_lora(dit, config["lora"])
+        svdquant_config = config["model"]["svdquant_dual"]
+        svdquant_checkpoint = checkpoint_path(
+            svdquant_config["name_or_path"], svdquant_config.get("filename")
+        )
+        dual_svdquant_count = load_dual_svdquant_linears(
+            dit.base_model.model, svdquant_checkpoint
+        )
+    else:
+        quantize_component(dit, dit_quantization)
+        dit = add_lora(dit, config["lora"])
     if train_config["gradient_checkpointing"]:
         dit.base_model.model.enable_gradient_checkpointing()
     model = RaggedEditModel(dit)
@@ -148,7 +173,8 @@ def main():
     if accelerator.is_main_process:
         accelerator.print(
             f"samples={len(dataset)} batch={train_config['batch_size']} "
-            f"dit_quant={config['model']['quantization']['dit']} "
+            f"dit_quant={dit_quantization} "
+            f"dual_svdquant_linears={dual_svdquant_count} "
             f"te_quant={config['model']['quantization']['text_encoder']}"
         )
 
