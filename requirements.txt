@@ -11,6 +11,8 @@ huggingface-hub
 einops
 Pillow
 PyYAML
+orjson
+tqdm
 bitsandbytes
 wandb
 # A100/A800/Ada: install flash-attn separately with --no-build-isolation.

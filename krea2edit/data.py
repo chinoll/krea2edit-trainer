@@ -1,7 +1,7 @@
-import json
 import math
 from pathlib import Path
 
+import orjson
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -144,26 +144,27 @@ class EditManifestDataset(Dataset):
         self.max_image_pixels = max_image_pixels
         self.alpha_transparency_threshold = alpha_transparency_threshold
         self.samples = []
-        for line in self.manifest.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            target = row["target"]
-            references = row["references"]
-            self.samples.append(
-                {
-                    "id": row["id"],
-                    "prompt": target.get("caption", target.get("prompt")),
-                    "target": self._resolve(target["image"]),
-                    "references": [
-                        {
-                            "id": reference["id"],
-                            "image": self._resolve(reference["image"]),
-                        }
-                        for reference in references
-                    ],
-                }
-            )
+        with self.manifest.open("rb") as manifest_file:
+            for line in manifest_file:
+                if not line.strip():
+                    continue
+                row = orjson.loads(line)
+                target = row["target"]
+                references = row["references"]
+                self.samples.append(
+                    {
+                        "id": row["id"],
+                        "prompt": target.get("caption", target.get("prompt")),
+                        "target": self._resolve(target["image"]),
+                        "references": [
+                            {
+                                "id": reference["id"],
+                                "image": self._resolve(reference["image"]),
+                            }
+                            for reference in references
+                        ],
+                    }
+                )
 
     def _resolve(self, value: str):
         path = Path(value)

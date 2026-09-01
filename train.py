@@ -9,6 +9,7 @@ from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import set_seed
 from diffusers.optimization import get_scheduler
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from krea2edit.data import EditManifestDataset, ragged_collate
 from krea2edit.modeling import (
@@ -257,7 +258,15 @@ def main():
     accumulated_loss = torch.zeros((), device=accelerator.device)
     accumulated_micro_steps = 0
     while global_step < int(train_config["steps"]):
-        for batch in dataloader:
+        data_progress = tqdm(
+            dataloader,
+            desc="Loading data",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not accelerator.is_main_process,
+        )
+        for batch in data_progress:
             with accelerator.accumulate(model):
                 with torch.no_grad():
                     contexts = [
@@ -345,6 +354,7 @@ def main():
                     )
                 if global_step >= int(train_config["steps"]):
                     break
+        data_progress.close()
 
     if global_step % int(train_config["save_every"]) != 0:
         save_checkpoint(accelerator, model, output_dir, global_step)

@@ -35,6 +35,9 @@ reference images + edit prompt
 
 DataLoader 不 stack 图像。一个 batch 内的 target H/W、参考图数量、参考图 H/W 和文本长度均可不同，也不需要 buckets。VAE 逐图编码后，每个样本形成一条独立序列，再用 `cu_seqlens` pack：
 
+训练时主进程会显示 `Loading data` tqdm 进度条，以 batch 为单位跟踪当前一轮
+DataLoader 的图像读取、透明处理与尺寸转换进度；其他分布式 rank 不重复输出。
+
 ```text
 sample 0: [text_0 | target_0 | refs_0]
 sample 1: [text_1 | target_1 | refs_1]
@@ -73,7 +76,8 @@ Krea 2 RAW 为 gated model，需要先在 Hugging Face 接受许可，并设置 
 
 ## 数据集
 
-训练入口只读取 JSONL manifest。每行是一条独立样本：
+训练入口只读取 JSONL manifest。文件以二进制流逐行读取并由 `orjson` 解析，不会先
+把整份 manifest 解码到内存。每行是一条独立样本：
 
 ```jsonl
 {"id":"edit-0001","target":{"image":"targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"scene","image":"refs/0001_scene.jpg"},{"id":"subject","image":"refs/0001_subject.png"}]}
