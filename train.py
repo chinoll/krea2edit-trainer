@@ -31,6 +31,9 @@ from krea2edit.sampling import PreviewDatasetView, generate_previews
 from krea2edit.timesteps import sample_timesteps
 
 
+DEEPSPEED_MUON_NAMES = {"deepspeed_muon", "muon"}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Krea2Edit ragged LoRA trainer")
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -42,8 +45,12 @@ def parse_args():
 
 
 def make_optimizer(model, config):
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if config["optimizer"] == "adamw8bit":
+    optimizer_name = str(config["optimizer"]).lower()
+    named_parameters = list(model.named_parameters())
+    parameters = [
+        parameter for _, parameter in named_parameters if parameter.requires_grad
+    ]
+    if optimizer_name == "adamw8bit":
         import bitsandbytes as bnb
 
         return bnb.optim.AdamW8bit(
@@ -52,11 +59,88 @@ def make_optimizer(model, config):
             betas=tuple(config["betas"]),
             weight_decay=float(config["weight_decay"]),
         )
-    return torch.optim.AdamW(
-        parameters,
-        lr=float(config["lr"]),
-        betas=tuple(config["betas"]),
-        weight_decay=float(config["weight_decay"]),
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(
+            parameters,
+            lr=float(config["lr"]),
+            betas=tuple(config["betas"]),
+            weight_decay=float(config["weight_decay"]),
+        )
+    if optimizer_name in DEEPSPEED_MUON_NAMES:
+        from deepspeed.runtime.zero.muon.muon_optimizer import MuonWithAuxAdam
+
+        for name, parameter in named_parameters:
+            lowered = name.lower()
+            parameter.use_muon = (
+                parameter.ndim >= 2
+                and "embed" not in lowered
+                and "lm_head" not in lowered
+            )
+
+        muon_parameters = [
+            parameter
+            for _, parameter in named_parameters
+            if parameter.requires_grad and parameter.use_muon
+        ]
+        adam_parameters = [
+            parameter
+            for _, parameter in named_parameters
+            if parameter.requires_grad and not parameter.use_muon
+        ]
+        parameter_groups = []
+        if muon_parameters:
+            parameter_groups.append(
+                {
+                    "name": "muon-params",
+                    "params": muon_parameters,
+                    "use_muon": True,
+                    "lr": float(config["muon_lr"]),
+                    "momentum": float(config["muon_momentum"]),
+                    "weight_decay": float(config["muon_weight_decay"]),
+                    "ns_method": config["muon_ns_method"],
+                }
+            )
+        if adam_parameters:
+            parameter_groups.append(
+                {
+                    "name": "adam-params",
+                    "params": adam_parameters,
+                    "use_muon": False,
+                    "lr": float(config["adam_lr"]),
+                    "betas": tuple(config["adam_betas"]),
+                    "eps": float(config["adam_eps"]),
+                    "weight_decay": float(config["adam_weight_decay"]),
+                }
+            )
+        return MuonWithAuxAdam(
+            parameter_groups,
+            adam_optimizer=torch.optim.AdamW,
+            adam_optimizer_kwargs={},
+            adam_w_mode=True,
+        )
+    raise ValueError(f"Unknown optimizer: {config['optimizer']}")
+
+
+def verify_deepspeed_muon_optimizer(optimizer):
+    from deepspeed.runtime.zero.muon.muon_optimizer import MuonWithAuxAdam
+
+    chain = []
+    current = optimizer
+    while current is not None:
+        chain.append(type(current).__name__)
+        if isinstance(current, MuonWithAuxAdam):
+            return " -> ".join(chain)
+        current = next(
+            (
+                getattr(current, name)
+                for name in ("optimizer", "_optimizer", "inner_optimizer")
+                if getattr(current, name, None) is not None
+            ),
+            None,
+        )
+    raise RuntimeError(
+        "DeepSpeed Muon was requested, but MuonWithAuxAdam is absent from the "
+        f"prepared optimizer chain: {' -> '.join(chain)}"
     )
 
 
@@ -140,6 +224,10 @@ def main():
 
     config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     train_config = config["train"]
+    optimizer_name = str(train_config["optimizer"]).lower()
+    use_deepspeed_muon = optimizer_name in DEEPSPEED_MUON_NAMES
+    if use_deepspeed_muon and not config["distributed"]["deepspeed_zero2"]:
+        raise ValueError("deepspeed_muon requires distributed.deepspeed_zero2: true")
     deepspeed = None
     if config["distributed"]["deepspeed_zero2"]:
         deepspeed = DeepSpeedPlugin(hf_ds_config={
@@ -152,7 +240,9 @@ def main():
                 "stage": 2,
                 "overlap_comm": True,
                 "contiguous_gradients": True,
-                "reduce_scatter": True,
+                "reduce_scatter": not use_deepspeed_muon,
+                "offload_optimizer": {"device": "none"},
+                "offload_param": {"device": "none"},
             },
         })
     mixed_precision = None if config["model"]["dtype"] == "fp32" else config["model"]["dtype"]
@@ -176,6 +266,7 @@ def main():
         int(data_config["min_image_pixels"]),
         int(data_config["max_image_pixels"]),
         int(data_config["alpha_transparency_threshold"]),
+        show_progress=accelerator.is_main_process,
     )
     dataloader = DataLoader(
         dataset,
@@ -207,6 +298,17 @@ def main():
     model = RaggedEditModel(dit)
 
     optimizer = make_optimizer(model, train_config)
+    optimizer_group_names = [group.get("name") for group in optimizer.param_groups]
+    muon_trainable_elements = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad and getattr(parameter, "use_muon", False)
+    )
+    adam_trainable_elements = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad and not getattr(parameter, "use_muon", False)
+    )
     scheduler = get_scheduler(
         train_config["lr_scheduler"],
         optimizer=optimizer,
@@ -214,6 +316,9 @@ def main():
         num_training_steps=int(train_config["steps"]),
     )
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    muon_optimizer_chain = (
+        verify_deepspeed_muon_optimizer(optimizer) if use_deepspeed_muon else None
+    )
     dataloader = accelerator.prepare_data_loader(dataloader, device_placement=False)
 
     conditioning = ConditioningModels(config["model"], dtype, accelerator.device)
@@ -227,6 +332,7 @@ def main():
             int(data_config["min_image_pixels"]),
             int(data_config["max_image_pixels"]),
             int(data_config["alpha_transparency_threshold"]),
+            show_progress=True,
         )
         sample_dataset = PreviewDatasetView(
             preview_source,
@@ -236,6 +342,7 @@ def main():
         te_quantization = config["model"]["quantization"]["text_encoder"]
         accelerator.print(
             f"samples={len(dataset)} batch={train_config['batch_size']} "
+            f"optimizer={optimizer_name} "
             f"dit_quant_backend={dit_quantization_backend} "
             f"dit_quant_weights={dit_quantization.get('weights', 'n/a')} "
             f"dual_svdquant_linears={dual_svdquant_count} "
@@ -246,6 +353,13 @@ def main():
             accelerator.print(
                 f"sample_every={sample_config['every']} "
                 f"sample_count={len(sample_config['samples'])}"
+            )
+        if muon_optimizer_chain:
+            accelerator.print(
+                f"optimizer_chain={muon_optimizer_chain} "
+                f"muon_trainable_elements={muon_trainable_elements} "
+                f"adam_trainable_elements={adam_trainable_elements} "
+                "reduce_scatter=false"
             )
 
     global_step = 0
@@ -323,14 +437,21 @@ def main():
                 ).item()
                 accumulated_loss.zero_()
                 accumulated_micro_steps = 0
-                accelerator.log(
-                    {
-                        "train/loss": mean_loss,
-                        "train/grad_norm": float(grad_norm),
-                        "train/lr": scheduler.get_last_lr()[0],
-                    },
-                    step=global_step,
-                )
+                learning_rates = scheduler.get_last_lr()
+                metrics = {
+                    "train/loss": mean_loss,
+                    "train/grad_norm": float(grad_norm),
+                    "train/lr": learning_rates[0],
+                }
+                if use_deepspeed_muon:
+                    for group_name, learning_rate in zip(
+                        optimizer_group_names, learning_rates
+                    ):
+                        if group_name == "muon-params":
+                            metrics["train/lr_muon"] = learning_rate
+                        elif group_name == "adam-params":
+                            metrics["train/lr_adam"] = learning_rate
+                accelerator.log(metrics, step=global_step)
                 if global_step % int(train_config["log_every"]) == 0:
                     accelerator.print(
                         f"step={global_step} loss={mean_loss:.6f} "

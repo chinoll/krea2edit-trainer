@@ -76,8 +76,11 @@ Krea 2 RAW 为 gated model，需要先在 Hugging Face 接受许可，并设置 
 
 ## 数据集
 
-训练入口只读取 JSONL manifest。文件以二进制流逐行读取并由 `orjson` 解析，不会先
-把整份 manifest 解码到内存。每行是一条独立样本：
+训练入口只读取 JSONL manifest。文件以二进制流逐行读取并由 `orjson` 解析，所有
+样本元描述在启动时加载到数据集索引，但不会先把整份 manifest 解码成一个大字符串。
+主进程的 `Loading manifest metadata` tqdm 按已完成反序列化的字节推进，因此无需
+为了计算总行数额外扫描一次文件，同时仍能显示百分比、速度、ETA 与最终样本数。
+每行是一条独立样本：
 
 ```jsonl
 {"id":"edit-0001","target":{"image":"targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"scene","image":"refs/0001_scene.jpg"},{"id":"subject","image":"refs/0001_subject.png"}]}
@@ -258,6 +261,38 @@ accelerate launch --config_file configs/accelerate_zero2.yaml \
 
 `distributed.deepspeed_zero2: true` 会由训练脚本创建 stage-2 plugin；梯度累积与裁剪直接读取训练 YAML。仓库同时提供原生 [configs/deepspeed_zero2.json](configs/deepspeed_zero2.json)，便于接入已有 DeepSpeed launcher。
 
+### DeepSpeed Muon
+
+DeepSpeed 0.19.6 及以上可使用其原生 ZeRO-2 `MuonWithAuxAdam`：
+
+```yaml
+distributed:
+  deepspeed_zero2: true
+
+train:
+  optimizer: deepspeed_muon
+  muon_lr: 2.0e-3
+  muon_momentum: 0.95
+  muon_weight_decay: 0.01
+  muon_ns_method: gram       # gram 或 standard
+  adam_lr: 1.2e-4
+  adam_betas: [0.9, 0.999]
+  adam_eps: 1.0e-8
+  adam_weight_decay: 0.01
+  lr_scheduler: constant_with_warmup
+  warmup_steps: 1000
+```
+
+训练器会在 DeepSpeed 接管模型前为所有参数设置 `use_muon`：二维及以上且名称不含
+`embed`/`lm_head` 的可训练参数进入 Muon 组，其余可训练参数进入辅助 AdamW 组。
+对于当前 PEFT LoRA 训练，这通常意味着 LoRA A/B 矩阵使用 Muon。两个参数组可以
+使用不同的初始学习率；Diffusers scheduler 会按相同比例调度它们。
+
+该模式只允许与脚本创建的 ZeRO-2 plugin 一起使用，不启用 optimizer/parameter
+offload，并采用 `reduce_scatter: false` 的保守路径。`accelerator.prepare()` 完成后，
+训练器会检查实际 optimizer wrapper 链中是否存在 `MuonWithAuxAdam`；若 DeepSpeed
+没有真正接管 Muon 会立即报错，主进程同时打印 wrapper 链和两组可训练参数量。
+
 ## W&B 训练记录
 
 先登录 W&B：
@@ -277,8 +312,9 @@ logging:
 
 `project_name` 是 W&B project 名称。训练器在每次实际 optimizer update 时记录
 梯度累积窗口平均值 `train/loss`、裁剪前 global L2 norm `train/grad_norm` 和
-`train/lr`；micro-step 不会产生重复记录。将 `logging.backend` 改为 `null` 可以
-关闭在线记录。
+`train/lr`；使用 DeepSpeed Muon 时还会分别记录 `train/lr_muon` 与
+`train/lr_adam`（存在辅助 Adam 组时）。micro-step 不会产生重复记录。将
+`logging.backend` 改为 `null` 可以关闭在线记录。
 
 ## 训练中采样
 

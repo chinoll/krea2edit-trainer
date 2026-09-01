@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.transforms.functional import pil_to_tensor
+from tqdm.auto import tqdm
 
 
 def training_grid_size(
@@ -138,33 +139,49 @@ class EditManifestDataset(Dataset):
         min_image_pixels: int,
         max_image_pixels: int,
         alpha_transparency_threshold: int,
+        show_progress: bool = True,
     ):
         self.manifest = Path(manifest).resolve()
         self.min_image_pixels = min_image_pixels
         self.max_image_pixels = max_image_pixels
         self.alpha_transparency_threshold = alpha_transparency_threshold
         self.samples = []
+        manifest_progress = tqdm(
+            total=self.manifest.stat().st_size,
+            desc="Loading manifest metadata",
+            unit="B",
+            unit_scale=True,
+            dynamic_ncols=True,
+            disable=not show_progress,
+        )
+        pending_progress_bytes = 0
         with self.manifest.open("rb") as manifest_file:
             for line in manifest_file:
-                if not line.strip():
-                    continue
-                row = orjson.loads(line)
-                target = row["target"]
-                references = row["references"]
-                self.samples.append(
-                    {
-                        "id": row["id"],
-                        "prompt": target.get("caption", target.get("prompt")),
-                        "target": self._resolve(target["image"]),
-                        "references": [
-                            {
-                                "id": reference["id"],
-                                "image": self._resolve(reference["image"]),
-                            }
-                            for reference in references
-                        ],
-                    }
-                )
+                if line.strip():
+                    row = orjson.loads(line)
+                    target = row["target"]
+                    references = row["references"]
+                    self.samples.append(
+                        {
+                            "id": row["id"],
+                            "prompt": target.get("caption", target.get("prompt")),
+                            "target": self._resolve(target["image"]),
+                            "references": [
+                                {
+                                    "id": reference["id"],
+                                    "image": self._resolve(reference["image"]),
+                                }
+                                for reference in references
+                            ],
+                        }
+                    )
+                pending_progress_bytes += len(line)
+                if pending_progress_bytes >= 1024 * 1024:
+                    manifest_progress.update(pending_progress_bytes)
+                    pending_progress_bytes = 0
+        manifest_progress.update(pending_progress_bytes)
+        manifest_progress.set_postfix(samples=len(self.samples), refresh=False)
+        manifest_progress.close()
 
     def _resolve(self, value: str):
         path = Path(value)
