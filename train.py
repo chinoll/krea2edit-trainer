@@ -169,8 +169,12 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
     accelerator.wait_for_everyone()
 
+    data_config = config["data"]
     dataset = EditManifestDataset(
-        config["data"]["manifest"], int(config["data"]["max_image_pixels"])
+        data_config["manifest"],
+        int(data_config["min_image_pixels"]),
+        int(data_config["max_image_pixels"]),
+        int(data_config["alpha_transparency_threshold"]),
     )
     dataloader = DataLoader(
         dataset,
@@ -218,7 +222,10 @@ def main():
     sample_dataset = None
     if sampling_enabled and accelerator.is_main_process:
         preview_source = EditManifestDataset(
-            sample_config["manifest"], int(config["data"]["max_image_pixels"])
+            sample_config["manifest"],
+            int(data_config["min_image_pixels"]),
+            int(data_config["max_image_pixels"]),
+            int(data_config["alpha_transparency_threshold"]),
         )
         sample_dataset = PreviewDatasetView(
             preview_source,

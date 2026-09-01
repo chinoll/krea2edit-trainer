@@ -29,7 +29,7 @@ reference images + edit prompt
              └─ ref_i:  frame=i, independent (h,w), t=0 clean
 ```
 
-参考图和目标图各自从 `(0,0)` 开始生成二维 RoPE 网格，没有 crop、padding 或目标图坐标偏移。每张图先保持比例执行单图像素上限，再轻微缩放到 16px 网格；因此原始输入 H/W 可以任意，目标和参考图也不需要相同比例或分辨率。
+参考图和目标图各自从 `(0,0)` 开始生成二维 RoPE 网格，没有位置编码层面的 crop、padding 或目标图坐标偏移。数据加载阶段会对 RGBA 透明边界做内容裁剪，并对每张图独立执行单图像素范围约束，最后轻微缩放到 16px 网格；因此原始输入 H/W 可以任意，目标和参考图也不需要相同比例或分辨率。
 
 ## Ragged batch 与注意力后端
 
@@ -92,11 +92,26 @@ RoPE frame 不写入数据：训练时按数组顺序自动分配为 `1..N`。�
 拼接顺序一致；单参考图始终是 `frame=1`。
 完整样例见 [configs/manifest.example.jsonl](configs/manifest.example.jsonl)。
 
-## 单图像素上限与任意分辨率
+## 单图像素范围、透明裁剪与任意分辨率
 
-`data.max_image_pixels` 同时作用于 target 和每一张 reference，但按单张图独立计算，不限制一条样本内所有参考图的像素总和。
+`data.min_image_pixels` 和 `data.max_image_pixels` 同时作用于 target 与每一张
+reference，并按单张图独立计算，不限制一条样本内所有参考图的像素总和。普通
+RGB 图像同样受最小像素量约束：当 `H × W` 小于下限时按比例放大，超过上限时
+按比例缩小，随后把两个边长轻微缩放到 16 的倍数。两个值分别设为 `0` 可以关闭
+对应的下限或上限。
 
-当 `H × W` 超过上限时，先按 `sqrt(limit / (H × W))` 等比缩小，再把两个边长轻微缩放到最接近的 16 倍数。对齐后若再次超过上限，则向下对齐。设置为 `0` 可关闭像素上限。
+RGBA 图像在缩放前执行以下处理：
+
+1. 将 `alpha <= data.alpha_transparency_threshold` 的像素视为完全透明；alpha 与阈值
+   均使用 `0..255`，默认阈值 `8` 用于过滤透明通道的数值抖动。
+2. 从四边向内移除全透明行列，得到非透明内容的紧致包围盒。
+3. 若包围盒面积小于 `data.min_image_pixels`，在原图边界内围绕内容向外扩展，直至
+   裁剪面积达到下限；如果整张原图本身仍小于下限，则保留整张图并在下一步等比
+   放大。
+4. 裁剪后将剩余透明和半透明区域合成到纯白背景，输出 RGB 图像。
+
+因此最小像素量不仅约束透明裁剪的下限，也约束所有普通图像的最终输入尺寸。
+训练集、独立 evaluate 数据集与采样生成尺寸使用同一组设置。
 
 ## DIT 与 TE 独立量化
 
@@ -294,9 +309,10 @@ sample:
 
 `sample.every` 按 `global_step` 计算，也就是实际 optimizer update 数；gradient
 accumulation 的 micro-step 不计数。省略某条样本的 `width`/`height` 时使用该条
-target 对齐后的尺寸；显式尺寸也会先按 `data.max_image_pixels` 等比缩小，再轻微
-对齐到模型的 16 像素网格。reference、ground truth target 和实际生成图均按单图
-分别满足该像素上限。单参考与多参考样本均可采样，多张输入图会渲染成 montage。
+target 对齐后的尺寸；显式尺寸也会先满足 `data.min_image_pixels` 与
+`data.max_image_pixels`，再轻微对齐到模型的 16 像素网格。reference、ground truth
+target 和实际生成图均按单图分别满足该像素范围。单参考与多参考样本均可采样，
+多张输入图会渲染成 montage。
 
 每个采样 cell 上方写编辑 prompt，下方为
 `[输入参考图 montage | 生成输出图 | ground truth target]`。训练器只根据样本数量

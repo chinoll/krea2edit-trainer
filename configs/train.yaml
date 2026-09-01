@@ -7,7 +7,11 @@ distributed:
 
 data:
   manifest: data/my_dataset/manifest.jsonl
+  # Per image, for target and every reference independently.
+  min_image_pixels: 262144
   max_image_pixels: 1048576
+  # RGBA alpha values at or below this value are treated as fully transparent.
+  alpha_transparency_threshold: 8
   num_workers: 4
 
 model:
