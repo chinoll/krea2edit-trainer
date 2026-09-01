@@ -1,2 +1,2 @@
-{"id":"scene-subject-0001","target":{"image":"../data/targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"scene","image":"../data/references/0001_scene.jpg"},{"id":"subject","image":"../data/references/0001_subject.png"}]}
-{"id":"subject-only-0002","target":{"image":"../data/targets/0002.png","caption":"Change the subject's jacket to red."},"references":[{"id":"subject","image":"../data/references/0002_subject.jpg"}]}
+{"id":"scene-subject-0001","target":{"image":"../data/targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"source","role":"source","image":"../data/references/0001_source.png"},{"id":"subject","role":"reference","image":"../data/references/0001_subject.png"}]}
+{"id":"subject-only-0002","target":{"image":"../data/targets/0002.png","caption":"Change the subject's jacket to red."},"references":[{"id":"source","role":"source","image":"../data/references/0002_source.png"}]}

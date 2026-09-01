@@ -7,16 +7,12 @@ from einops import rearrange
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from torchvision.transforms.functional import to_pil_image
 
-from krea2edit.data import training_grid_size
-
 
 class PreviewDatasetView:
     """ID-addressable view that only indexes the configured preview samples."""
 
     def __init__(self, dataset, sample_ids: list[str]):
         self.dataset = dataset
-        self.min_image_pixels = dataset.min_image_pixels
-        self.max_image_pixels = dataset.max_image_pixels
         wanted = set(sample_ids)
         self.indices_by_id = {}
         if not wanted:
@@ -78,19 +74,9 @@ def sample_edit(
     steps: int,
     guidance_scale: float,
     seed: int,
-    min_image_pixels: int,
-    max_image_pixels: int,
     negative_prompt: str = "",
     schedule_mu: float | None = None,
 ):
-    alignment = conditioning.vae_scale_factor * model.patch
-    height, width = training_grid_size(
-        height,
-        width,
-        min_pixels=min_image_pixels,
-        max_pixels=max_image_pixels,
-        alignment=alignment,
-    )
     latent_width = width // conditioning.vae_scale_factor
     latent_height = height // conditioning.vae_scale_factor
 
@@ -233,8 +219,7 @@ def generate_previews(
     try:
         for specification in config["samples"]:
             sample = dataset.get_by_id(specification["id"])
-            height = int(specification.get("height", sample["target"].shape[-2]))
-            width = int(specification.get("width", sample["target"].shape[-1]))
+            height, width = sample["target"].shape[-2:]
             seed = int(specification.get("seed", 42))
             output = sample_edit(
                 model=model,
@@ -246,8 +231,6 @@ def generate_previews(
                 steps=int(config["steps"]),
                 guidance_scale=float(config["guidance_scale"]),
                 seed=seed,
-                min_image_pixels=dataset.min_image_pixels,
-                max_image_pixels=dataset.max_image_pixels,
                 negative_prompt=str(config.get("negative_prompt", "")),
                 schedule_mu=config.get("schedule_mu"),
             )

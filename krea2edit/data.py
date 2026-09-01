@@ -60,6 +60,14 @@ def resize_to_training_grid(
     return image
 
 
+def resize_to_size(image: torch.Tensor, height: int, width: int):
+    if image.shape[-2:] != (height, width):
+        image = F.interpolate(
+            image.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False
+        ).squeeze(0)
+    return image
+
+
 def _expanded_crop_box(
     box: tuple[int, int, int, int],
     image_size: tuple[int, int],
@@ -94,23 +102,88 @@ def _expanded_crop_box(
     return left, top, left + crop_width, top + crop_height
 
 
-def crop_and_flatten_alpha(
-    image: Image.Image,
-    min_pixels: int,
-    alpha_transparency_threshold: int,
-):
+def threshold_alpha(image: Image.Image, alpha_transparency_threshold: int):
+    if "A" not in image.getbands():
+        return image.convert("RGB")
+
     rgba = image.convert("RGBA")
     alpha = rgba.getchannel("A").point(
         lambda value: 0 if value <= alpha_transparency_threshold else value
     )
     rgba.putalpha(alpha)
-    content_box = alpha.getbbox()
-    if content_box is not None:
-        rgba = rgba.crop(_expanded_crop_box(content_box, rgba.size, min_pixels))
+    return rgba
 
+
+def content_box(image: Image.Image):
+    if "A" not in image.getbands():
+        return 0, 0, image.width, image.height
+    return image.getchannel("A").getbbox()
+
+
+def flatten_alpha(image: Image.Image):
+    if "A" not in image.getbands():
+        return image.convert("RGB")
+
+    rgba = image.convert("RGBA")
     background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
     background.alpha_composite(rgba)
     return background.convert("RGB")
+
+
+def crop_and_flatten_alpha(
+    image: Image.Image,
+    min_pixels: int,
+    alpha_transparency_threshold: int,
+):
+    image = threshold_alpha(image, alpha_transparency_threshold)
+    box = content_box(image)
+    if box is not None:
+        image = image.crop(_expanded_crop_box(box, image.size, min_pixels))
+    return flatten_alpha(image)
+
+
+def image_to_tensor(image: Image.Image):
+    return pil_to_tensor(flatten_alpha(image)).float().div_(255.0)
+
+
+def load_pil_image(path: Path):
+    with Image.open(path) as source:
+        source.load()
+        return source.copy()
+
+
+def prepare_aligned_images(
+    images: list[Image.Image],
+    min_pixels: int,
+    max_pixels: int,
+    alpha_transparency_threshold: int,
+):
+    """Apply one crop box and one resize geometry to target + aligned sources."""
+    images = [
+        threshold_alpha(image, alpha_transparency_threshold) for image in images
+    ]
+    canvas_size = images[0].size
+    if any(image.size != canvas_size for image in images[1:]):
+        raise ValueError("target and role=source references must have identical canvas sizes")
+
+    boxes = [box for image in images if (box := content_box(image)) is not None]
+    if boxes:
+        union_box = (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+        crop_box = _expanded_crop_box(union_box, canvas_size, min_pixels)
+        images = [image.crop(crop_box) for image in images]
+
+    height, width = training_grid_size(
+        images[0].height,
+        images[0].width,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    return [resize_to_size(image_to_tensor(image), height, width) for image in images]
 
 
 def load_image(
@@ -119,14 +192,14 @@ def load_image(
     max_pixels: int,
     alpha_transparency_threshold: int,
 ):
-    with Image.open(path) as source:
-        if "A" in source.getbands():
-            image = crop_and_flatten_alpha(
-                source, min_pixels, alpha_transparency_threshold
-            )
-        else:
-            image = source.convert("RGB")
-    tensor = pil_to_tensor(image).float().div_(255.0)
+    source = load_pil_image(path)
+    if "A" in source.getbands():
+        image = crop_and_flatten_alpha(
+            source, min_pixels, alpha_transparency_threshold
+        )
+    else:
+        image = source.convert("RGB")
+    tensor = image_to_tensor(image)
     return resize_to_training_grid(tensor, min_pixels, max_pixels)
 
 
@@ -170,8 +243,11 @@ class EditManifestDataset(Dataset):
                                 {
                                     "id": reference["id"],
                                     "image": self._resolve(reference["image"]),
+                                    "role": reference.get(
+                                        "role", "source" if index == 0 else "reference"
+                                    ),
                                 }
-                                for reference in references
+                                for index, reference in enumerate(references)
                             ],
                         }
                     )
@@ -192,24 +268,49 @@ class EditManifestDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        return {
-            "id": sample["id"],
-            "prompt": sample["prompt"],
-            "target": load_image(
+        aligned_indices = [
+            reference_index
+            for reference_index, reference in enumerate(sample["references"])
+            if reference["role"] == "source"
+        ]
+        references = [None] * len(sample["references"])
+
+        if aligned_indices:
+            aligned_images = prepare_aligned_images(
+                [load_pil_image(sample["target"])]
+                + [
+                    load_pil_image(sample["references"][reference_index]["image"])
+                    for reference_index in aligned_indices
+                ],
+                self.min_image_pixels,
+                self.max_image_pixels,
+                self.alpha_transparency_threshold,
+            )
+            target = aligned_images[0]
+            for reference_index, image in zip(aligned_indices, aligned_images[1:]):
+                references[reference_index] = image
+        else:
+            target = load_image(
                 sample["target"],
                 self.min_image_pixels,
                 self.max_image_pixels,
                 self.alpha_transparency_threshold,
-            ),
-            "references": [
-                load_image(
+            )
+
+        for reference_index, reference in enumerate(sample["references"]):
+            if references[reference_index] is None:
+                references[reference_index] = load_image(
                     reference["image"],
                     self.min_image_pixels,
                     self.max_image_pixels,
                     self.alpha_transparency_threshold,
                 )
-                for reference in sample["references"]
-            ],
+
+        return {
+            "id": sample["id"],
+            "prompt": sample["prompt"],
+            "target": target,
+            "references": references,
         }
 
 

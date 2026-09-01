@@ -26,7 +26,8 @@ model:
   quantization:
     dit:
       backend: quanto
-      weights: qint8
+      # FP8 frozen base weights with BF16 activations (W8A16).
+      weights: qfloat8
     text_encoder:
       backend: quanto
       weights: qint8
@@ -82,8 +83,6 @@ sample:
   samples: []
   # samples:
   #   - id: scene-subject-0001
-  #     width: 512
-  #     height: 512
   #     seed: 42
 
 logging:

@@ -29,7 +29,11 @@ reference images + edit prompt
              └─ ref_i:  frame=i, independent (h,w), t=0 clean
 ```
 
-参考图和目标图各自从 `(0,0)` 开始生成二维 RoPE 网格，没有位置编码层面的 crop、padding 或目标图坐标偏移。数据加载阶段会对 RGBA 透明边界做内容裁剪，并对每张图独立执行单图像素范围约束，最后轻微缩放到 16px 网格；因此原始输入 H/W 可以任意，目标和参考图也不需要相同比例或分辨率。
+参考图和目标图各自从 `(0,0)` 开始生成二维 RoPE 网格，没有位置编码层面的
+crop、padding 或目标图坐标偏移。数据加载阶段会让 target 与 `role: source` 的编辑
+输入共用透明裁剪框和最终缩放尺寸，保持逐像素几何一致；其他辅助参考图独立执行
+透明裁剪与单图像素范围约束。所有结果最后轻微缩放到 16px 网格，辅助参考图仍可
+使用任意比例和分辨率。
 
 ## Ragged batch 与注意力后端
 
@@ -83,8 +87,8 @@ Krea 2 RAW 为 gated model，需要先在 Hugging Face 接受许可，并设置 
 每行是一条独立样本：
 
 ```jsonl
-{"id":"edit-0001","target":{"image":"targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"scene","image":"refs/0001_scene.jpg"},{"id":"subject","image":"refs/0001_subject.png"}]}
-{"id":"edit-0002","target":{"image":"targets/0002.jpg","caption":"Make the jacket red."},"references":[{"id":"subject","image":"refs/0002_subject.jpg"}]}
+{"id":"edit-0001","target":{"image":"targets/0001.png","caption":"Place the subject on a beach at sunset."},"references":[{"id":"source","role":"source","image":"refs/0001_source.png"},{"id":"subject","role":"reference","image":"refs/0001_subject.png"}]}
+{"id":"edit-0002","target":{"image":"targets/0002.png","caption":"Make the jacket red."},"references":[{"id":"source","role":"source","image":"refs/0002_source.png"}]}
 ```
 
 路径相对于 manifest 所在目录解析，也可以写绝对路径。字段含义：
@@ -93,6 +97,11 @@ Krea 2 RAW 为 gated model，需要先在 Hugging Face 接受许可，并设置 
 - `target.image`：监督目标图。
 - `target.caption` 或 `target.prompt`：编辑指令。
 - `references`：一张或多张参考图，数组顺序就是传给 ComfyUI 节点的参考图顺序。
+- `references[].role: source`：与 target 像素对齐的编辑输入。它必须和 target 具有
+  相同的原始画布尺寸，并与 target 共用裁剪框和最终缩放尺寸。
+- `references[].role: reference`：身份、风格等不要求像素对齐的辅助参考，独立处理
+  尺寸。为兼容旧 manifest，省略 `role` 时第一张 reference 默认为 `source`，后续
+  reference 默认为 `reference`；新数据建议始终显式填写。
 
 RoPE frame 不写入数据：训练时按数组顺序自动分配为 `1..N`。这与
 `comfyui-krea2edit` 的 `source_image`、`source_image_b`、`reference_images`
@@ -101,24 +110,31 @@ RoPE frame 不写入数据：训练时按数组顺序自动分配为 `1..N`。�
 
 ## 单图像素范围、透明裁剪与任意分辨率
 
-`data.min_image_pixels` 和 `data.max_image_pixels` 同时作用于 target 与每一张
-reference，并按单张图独立计算，不限制一条样本内所有参考图的像素总和。普通
-RGB 图像同样受最小像素量约束：当 `H × W` 小于下限时按比例放大，超过上限时
-按比例缩小，随后把两个边长轻微缩放到 16 的倍数。两个值分别设为 `0` 可以关闭
-对应的下限或上限。
+`data.min_image_pixels` 和 `data.max_image_pixels` 同时作用于 target 与所有
+reference，不限制一条样本内所有参考图的像素总和。target 与 `role: source` 的
+reference 作为一个像素对齐组计算一次最终尺寸；其他 reference 按单张图独立
+计算。普通 RGB 图像同样受最小像素量约束：当 `H × W` 小于下限时按比例放大，
+超过上限时按比例缩小，随后把两个边长轻微缩放到 16 的倍数。两个值分别设为
+`0` 可以关闭对应的下限或上限。
 
 RGBA 图像在缩放前执行以下处理：
 
 1. 将 `alpha <= data.alpha_transparency_threshold` 的像素视为完全透明；alpha 与阈值
    均使用 `0..255`，默认阈值 `8` 用于过滤透明通道的数值抖动。
-2. 从四边向内移除全透明行列，得到非透明内容的紧致包围盒。
+2. 对 target 与所有 `role: source` 图像计算非透明内容包围盒的并集，再从四边使用
+   同一个并集框向内裁剪；辅助 reference 使用自己的包围盒。像素对齐组中只要有
+   一张普通 RGB 图，就将它视为整张画布均不透明，因此保留完整共享画布。
 3. 若包围盒面积小于 `data.min_image_pixels`，在原图边界内围绕内容向外扩展，直至
    裁剪面积达到下限；如果整张原图本身仍小于下限，则保留整张图并在下一步等比
    放大。
-4. 裁剪后将剩余透明和半透明区域合成到纯白背景，输出 RGB 图像。
+4. target 与 `role: source` 使用完全相同的裁剪框、插值坐标和最终 H/W；辅助
+   reference 独立缩放。
+5. 裁剪前先稳定 alpha；裁剪后将剩余透明和半透明区域合成到纯白背景、删除 alpha
+   通道，再执行共享或独立缩放。最终交给模型的图像均为 RGB。
 
 因此最小像素量不仅约束透明裁剪的下限，也约束所有普通图像的最终输入尺寸。
-训练集、独立 evaluate 数据集与采样生成尺寸使用同一组设置。
+训练集和独立 evaluate 数据集使用相同的数据几何。采样输出始终使用预处理后 GT
+target 的 H/W，因此生成图与 GT 完全同尺寸。
 
 ## DIT 与 TE 独立量化
 
@@ -130,13 +146,17 @@ model:
   quantization:
     dit:
       backend: quanto
-      weights: qint8
+      weights: qfloat8
     text_encoder:
       backend: none
 ```
 
 通用后端为 `none` 和 `quanto`。选择 `quanto` 时，`weights` 支持 `qint4`、
 `qint8`、`qfloat8`。DIT 还支持下面单独说明的实验性 `svdquant_dual` 后端。
+默认 DIT 配置使用 `qfloat8`：冻结基座权重以 FP8 保存，激活不量化并保持
+`model.dtype: bf16`，即 W8A16。PEFT LoRA 参数也保持训练 dtype。这个路径以降低
+常驻权重显存为目标；A100 没有原生 FP8 Tensor Core，Quanto 会在矩阵乘时转换到
+可计算的浮点类型，因此不承诺加速。
 例如只量化 VLM：
 
 ```yaml
@@ -338,21 +358,16 @@ sample:
   schedule_mu: null      # null 使用随输出 token 数变化的 Krea dynamic shift
   samples:
     - id: val-0001
-      width: 512
-      height: 512
       seed: 42
     - id: val-0002
-      width: 768
-      height: 512
       seed: 43
 ```
 
 `sample.every` 按 `global_step` 计算，也就是实际 optimizer update 数；gradient
-accumulation 的 micro-step 不计数。省略某条样本的 `width`/`height` 时使用该条
-target 对齐后的尺寸；显式尺寸也会先满足 `data.min_image_pixels` 与
-`data.max_image_pixels`，再轻微对齐到模型的 16 像素网格。reference、ground truth
-target 和实际生成图均按单图分别满足该像素范围。单参考与多参考样本均可采样，
-多张输入图会渲染成 montage。
+accumulation 的 micro-step 不计数。每条样本的生成尺寸固定为该条预处理后 GT
+target 的尺寸，不提供单独的 `width`/`height` 覆盖；因此最大/最小像素量和 16px
+网格对齐只执行一次，生成图与 ground truth 始终具有相同 H/W。单参考与多参考
+样本均可采样，多张输入图会渲染成 montage。
 
 每个采样 cell 上方写编辑 prompt，下方为
 `[输入参考图 montage | 生成输出图 | ground truth target]`。训练器只根据样本数量
