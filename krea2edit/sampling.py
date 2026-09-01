@@ -1,5 +1,4 @@
 import math
-import re
 import textwrap
 from pathlib import Path
 
@@ -196,6 +195,21 @@ def render_preview_sheet(
     return sheet
 
 
+def render_preview_grid(sheets: list[Image.Image]):
+    columns = math.ceil(math.sqrt(len(sheets)))
+    rows = math.ceil(len(sheets) / columns)
+    cell_width = max(sheet.width for sheet in sheets)
+    cell_height = max(sheet.height for sheet in sheets)
+    grid = Image.new(
+        "RGB", (columns * cell_width, rows * cell_height), (16, 16, 16)
+    )
+    for index, sheet in enumerate(sheets):
+        x = (index % columns) * cell_width + (cell_width - sheet.width) // 2
+        y = (index // columns) * cell_height + (cell_height - sheet.height) // 2
+        grid.paste(sheet, (x, y))
+    return grid, rows, columns
+
+
 def generate_previews(
     model,
     conditioning,
@@ -206,7 +220,8 @@ def generate_previews(
 ):
     step_dir = output_dir / "samples" / f"step-{step:08d}"
     step_dir.mkdir(parents=True, exist_ok=True)
-    results = []
+    sample_ids = []
+    sheets = []
     was_training = model.training
     model.eval()
     try:
@@ -232,10 +247,17 @@ def generate_previews(
             sheet = render_preview_sheet(
                 sample["references"], output, sample["target"], sample["prompt"]
             )
-            filename = re.sub(r"[^0-9A-Za-z._-]+", "_", sample["id"])
-            path = step_dir / f"{filename}.webp"
-            sheet.save(path, format="WEBP", quality=80)
-            results.append((sample["id"], path))
+            sample_ids.append(sample["id"])
+            sheets.append(sheet)
     finally:
         model.train(was_training)
-    return results
+
+    grid, rows, columns = render_preview_grid(sheets)
+    path = step_dir / "preview-grid.webp"
+    grid.save(path, format="WEBP", quality=80)
+    return {
+        "path": path,
+        "rows": rows,
+        "columns": columns,
+        "sample_ids": sample_ids,
+    }

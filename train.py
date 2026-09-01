@@ -87,7 +87,7 @@ def run_previews(
 ):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        results = generate_previews(
+        result = generate_previews(
             accelerator.unwrap_model(model),
             conditioning,
             dataset,
@@ -96,18 +96,21 @@ def run_previews(
             step,
         )
         accelerator.print(
-            f"step={step} samples="
-            + ", ".join(str(path) for _, path in results)
+            f"step={step} sample_grid={result['rows']}x{result['columns']} "
+            f"samples={len(result['sample_ids'])} path={result['path']}"
         )
-        if logging_backend == "wandb" and results:
+        if logging_backend == "wandb":
             import wandb
 
             accelerator.log(
                 {
-                    "samples/previews": [
-                        wandb.Image(str(path), caption=sample_id)
-                        for sample_id, path in results
-                    ]
+                    "samples/previews": wandb.Image(
+                        str(result["path"]),
+                        caption=(
+                            f"{result['rows']}x{result['columns']} grid, "
+                            f"{len(result['sample_ids'])} samples"
+                        ),
+                    )
                 },
                 step=step,
             )

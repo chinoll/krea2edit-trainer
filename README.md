@@ -298,16 +298,18 @@ target 对齐后的尺寸；显式尺寸也会先按 `data.max_image_pixels` 等
 对齐到模型的 16 像素网格。reference、ground truth target 和实际生成图均按单图
 分别满足该像素上限。单参考与多参考样本均可采样，多张输入图会渲染成 montage。
 
-预览图上方写编辑 prompt，下方为
-`[输入参考图 montage | 生成输出图 | ground truth target]`，保存到：
+每个采样 cell 上方写编辑 prompt，下方为
+`[输入参考图 montage | 生成输出图 | ground truth target]`。训练器只根据样本数量
+`N` 自动确定接近正方形的 grid：`W = ceil(sqrt(N))`、`H = ceil(N / W)`；不足的
+cell 留空。每个采样 step 只保存一张合并图：
 
 ```text
-output/krea2edit/samples/step-00000250/<sample-id>.webp
+output/krea2edit/samples/step-00000250/preview-grid.webp
 ```
 
-预览以有损 WebP `quality=80` 保存，避免长期训练的本地与 W&B 图片占用过大。
-当 `logging.backend: wandb` 时，训练器直接把这些 WebP 文件记录到
-`samples/previews`，不会额外生成 PNG。
+grid 以有损 WebP `quality=80` 保存，避免长期训练的本地与 W&B 图片占用过大。
+当 `logging.backend: wandb` 时，每个采样 step 只把这一张 WebP 记录到
+`samples/previews`，不会上传各个 cell，也不会额外生成 PNG。
 
 ## Checkpoint
 
