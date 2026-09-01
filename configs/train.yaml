@@ -20,13 +20,12 @@ model:
   grounding_max_px: 768
   grounding_jitter_min: 384
   quantization:
-    # Independent switches. DIT additionally supports experimental svdquant_dual.
-    dit: int8
-    text_encoder: int8
-  # Used only when quantization.dit is svdquant_dual.
-  svdquant_dual:
-    name_or_path: weights/krea2edit-svdquant-dual.safetensors
-    filename: null
+    dit:
+      backend: quanto
+      weights: qint8
+    text_encoder:
+      backend: quanto
+      weights: qint8
 
 lora:
   rank: 64

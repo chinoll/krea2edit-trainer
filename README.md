@@ -100,26 +100,44 @@ RoPE frame 不写入数据：训练时按数组顺序自动分配为 `1..N`。�
 
 ## DIT 与 TE 独立量化
 
-配置中的两个开关互不依赖：
+配置直接指定量化后端，精度是该后端的参数，不再用 `int8` 之类的精度名称代替
+后端。DIT 与 TE 的配置互不依赖：
 
 ```yaml
 model:
   quantization:
-    dit: int8
-    text_encoder: none
+    dit:
+      backend: quanto
+      weights: qint8
+    text_encoder:
+      backend: none
 ```
 
-两项均支持 `none`、`int4`、`int8`、`float8`。DIT 还支持下面单独说明的实验性
-`svdquant_dual`。例如只量化 VLM：
+通用后端为 `none` 和 `quanto`。选择 `quanto` 时，`weights` 支持 `qint4`、
+`qint8`、`qfloat8`。DIT 还支持下面单独说明的实验性 `svdquant_dual` 后端。
+例如只量化 VLM：
 
 ```yaml
 model:
   quantization:
-    dit: none
-    text_encoder: int8
+    dit:
+      backend: none
+    text_encoder:
+      backend: quanto
+      weights: qint8
 ```
 
-DIT 基座先由 Optimum Quanto 量化并冻结，然后 PEFT 在量化 Linear 上挂载 LoRA；TE 只参与无梯度的多模态编码。VAE 保持训练 dtype，不跟随这两个量化开关。
+在这个示例中，DIT 的 `backend: none` 表示 **不量化 DIT**；只有 TE 使用
+Quanto `qint8`。
+
+这里的 `backend` 只决定冻结基座采用哪种权重后端，不决定参数是否参与训练：
+
+- DIT 始终冻结基座，只训练 PEFT LoRA。`backend: none` 保留 `model.dtype` 权重；
+  `backend: quanto` 先把基座转换成指定的 Quanto `weights`，再挂载 LoRA。
+- TE 始终以 eval/no-grad 模式生成多模态条件。`backend` 只改变它的权重表示。
+- VAE 始终冻结并保持 `model.dtype`，不受 `model.quantization` 控制。
+
+DIT 的 `svdquant_dual` 是独立的实验后端，加载顺序和梯度近似方式见下一节。
 
 ## 实验性双向 SVDQuant
 
@@ -164,11 +182,13 @@ python train.py \
 ```yaml
 model:
   quantization:
-    dit: svdquant_dual
-    text_encoder: int8
-  svdquant_dual:
-    name_or_path: weights/krea2edit-svdquant-dual.safetensors
-    filename: null
+    dit:
+      backend: svdquant_dual
+      name_or_path: weights/krea2edit-svdquant-dual.safetensors
+      filename: null
+    text_encoder:
+      backend: quanto
+      weights: qint8
 ```
 
 只有输入、输出通道均为 128 倍数且出现在 checkpoint 中的 Linear 会被替换；首尾

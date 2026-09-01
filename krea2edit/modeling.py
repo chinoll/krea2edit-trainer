@@ -65,13 +65,16 @@ def load_dit(config: dict, dtype: torch.dtype):
     return model
 
 
-def quantize_component(model: nn.Module, qtype_name: str):
-    if qtype_name == "none":
+def quantize_component(model: nn.Module, config: dict):
+    backend = config["backend"]
+    if backend == "none":
         model.requires_grad_(False)
         return model
+    if backend != "quanto":
+        raise ValueError(f"unsupported component quantization backend: {backend}")
     from optimum.quanto import freeze, qfloat8, qint4, qint8, quantize
 
-    qtype = {"int4": qint4, "int8": qint8, "float8": qfloat8}[qtype_name]
+    qtype = {"qint4": qint4, "qint8": qint8, "qfloat8": qfloat8}[config["weights"]]
     quantize(model, weights=qtype)
     freeze(model)
     return model

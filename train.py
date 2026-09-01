@@ -141,12 +141,12 @@ def main():
     dtype = torch_dtype(config["model"]["dtype"])
     dit = load_dit(config["model"]["dit"], dtype)
     dit_quantization = config["model"]["quantization"]["dit"]
+    dit_quantization_backend = dit_quantization["backend"]
     dual_svdquant_count = 0
-    if dit_quantization == "svdquant_dual":
+    if dit_quantization_backend == "svdquant_dual":
         dit = add_lora(dit, config["lora"])
-        svdquant_config = config["model"]["svdquant_dual"]
         svdquant_checkpoint = checkpoint_path(
-            svdquant_config["name_or_path"], svdquant_config.get("filename")
+            dit_quantization["name_or_path"], dit_quantization.get("filename")
         )
         dual_svdquant_count = load_dual_svdquant_linears(
             dit.base_model.model, svdquant_checkpoint
@@ -171,11 +171,14 @@ def main():
     conditioning = ConditioningModels(config["model"], dtype, accelerator.device)
     accelerator.init_trackers(config["project_name"], config=config)
     if accelerator.is_main_process:
+        te_quantization = config["model"]["quantization"]["text_encoder"]
         accelerator.print(
             f"samples={len(dataset)} batch={train_config['batch_size']} "
-            f"dit_quant={dit_quantization} "
+            f"dit_quant_backend={dit_quantization_backend} "
+            f"dit_quant_weights={dit_quantization.get('weights', 'n/a')} "
             f"dual_svdquant_linears={dual_svdquant_count} "
-            f"te_quant={config['model']['quantization']['text_encoder']}"
+            f"te_quant_backend={te_quantization['backend']} "
+            f"te_quant_weights={te_quantization.get('weights', 'n/a')}"
         )
 
     global_step = 0
