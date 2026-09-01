@@ -261,6 +261,54 @@ logging:
 `train/lr`；micro-step 不会产生重复记录。将 `logging.backend` 改为 `null` 可以
 关闭在线记录。
 
+## 训练中采样
+
+采样走完整的编辑推理路径：参考图同时经过 Qwen3-VL 与 VAE，参考 latent 在
+DiT 内保持 `t=0`，target 从固定 seed 的噪声开始，按 Krea resolution-aware
+flow schedule 积分到 `t=0`。采样时关闭 grounding 尺寸抖动，并使用 VAE posterior
+mode 编码参考图，因此相同样本和 seed 可以跨 checkpoint 直接比较。
+
+采样使用独立 evaluate 数据集，不进入训练 DataLoader。evaluate manifest 与训练
+manifest 使用完全相同的结构，建议从训练数据中排除这些样本。配置中的 `id`
+对应 evaluate manifest 顶层的样本 ID：
+
+```yaml
+sample:
+  enabled: true
+  manifest: data/evaluate/manifest.jsonl
+  every: 250             # 每 250 个 optimizer update 采样一次
+  steps: 20
+  guidance_scale: 4.5
+  negative_prompt: ""
+  schedule_mu: null      # null 使用随输出 token 数变化的 Krea dynamic shift
+  samples:
+    - id: val-0001
+      width: 512
+      height: 512
+      seed: 42
+    - id: val-0002
+      width: 768
+      height: 512
+      seed: 43
+```
+
+`sample.every` 按 `global_step` 计算，也就是实际 optimizer update 数；gradient
+accumulation 的 micro-step 不计数。省略某条样本的 `width`/`height` 时使用该条
+target 对齐后的尺寸；显式尺寸也会先按 `data.max_image_pixels` 等比缩小，再轻微
+对齐到模型的 16 像素网格。reference、ground truth target 和实际生成图均按单图
+分别满足该像素上限。单参考与多参考样本均可采样，多张输入图会渲染成 montage。
+
+预览图上方写编辑 prompt，下方为
+`[输入参考图 montage | 生成输出图 | ground truth target]`，保存到：
+
+```text
+output/krea2edit/samples/step-00000250/<sample-id>.webp
+```
+
+预览以有损 WebP `quality=80` 保存，避免长期训练的本地与 W&B 图片占用过大。
+当 `logging.backend: wandb` 时，训练器直接把这些 WebP 文件记录到
+`samples/previews`，不会额外生成 PNG。
+
 ## Checkpoint
 
 每次保存会写入：
@@ -303,6 +351,7 @@ train:
 - 独立入口：[train.py](train.py)
 - ragged manifest 数据层：[krea2edit/data.py](krea2edit/data.py)
 - 权重、VLM/VAE、Quanto、PEFT 与 packed model：[krea2edit/modeling.py](krea2edit/modeling.py)
+- reference-conditioned flow 采样与 WebP 预览：[krea2edit/sampling.py](krea2edit/sampling.py)
 - 实验性双向 SVDQuant、转置 checkpoint 与 autograd：[krea2edit/svdquant.py](krea2edit/svdquant.py)
 - timestep 策略：[krea2edit/timesteps.py](krea2edit/timesteps.py)
 - DiT 与 FA2/FA4 实现：[krea2edit/mmdit.py](krea2edit/mmdit.py)

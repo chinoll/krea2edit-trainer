@@ -9,9 +9,7 @@ from torch.utils.data import Dataset
 from torchvision.transforms.functional import pil_to_tensor
 
 
-def resize_to_training_grid(image: torch.Tensor, max_pixels: int, alignment: int = 16):
-    """Aspect-preserving pixel cap followed by a small resize to the model grid."""
-    height, width = image.shape[-2:]
+def training_grid_size(height: int, width: int, max_pixels: int, alignment: int = 16):
     if max_pixels > 0 and height * width > max_pixels:
         scale = math.sqrt(max_pixels / float(height * width))
         height = max(1, round(height * scale))
@@ -23,6 +21,14 @@ def resize_to_training_grid(image: torch.Tensor, max_pixels: int, alignment: int
         scale = math.sqrt(max_pixels / float(height * width))
         height = max(alignment, int(height * scale) // alignment * alignment)
         width = max(alignment, int(width * scale) // alignment * alignment)
+    return height, width
+
+
+def resize_to_training_grid(image: torch.Tensor, max_pixels: int, alignment: int = 16):
+    """Aspect-preserving pixel cap followed by a small resize to the model grid."""
+    height, width = training_grid_size(
+        *image.shape[-2:], max_pixels=max_pixels, alignment=alignment
+    )
 
     if image.shape[-2:] != (height, width):
         image = F.interpolate(

@@ -56,5 +56,21 @@ train:
   save_every: 250
   resume_from: null
 
+sample:
+  enabled: false
+  manifest: data/evaluate/manifest.jsonl
+  # Counts optimizer updates, not gradient-accumulation micro-steps.
+  every: 250
+  steps: 20
+  guidance_scale: 4.5
+  negative_prompt: ""
+  schedule_mu: null
+  samples: []
+  # samples:
+  #   - id: scene-subject-0001
+  #     width: 512
+  #     height: 512
+  #     seed: 42
+
 logging:
   backend: wandb

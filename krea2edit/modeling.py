@@ -144,14 +144,15 @@ class ConditioningModels:
         self.vae.requires_grad_(False).eval().to(device)
         self.dtype = dtype
         self.device = device
+        self.vae_scale_factor = int(config.get("vae_scale_factor", 8))
         self.grounding_max_px = int(config.get("grounding_max_px", 768))
         self.grounding_jitter_min = int(config.get("grounding_jitter_min", 384))
 
-    def _grounding_pil(self, image: torch.Tensor):
+    def _grounding_pil(self, image: torch.Tensor, jitter: bool = True):
         from torchvision.transforms.functional import to_pil_image
 
         cap = self.grounding_max_px
-        if 0 < self.grounding_jitter_min < cap:
+        if jitter and 0 < self.grounding_jitter_min < cap:
             cap = random.randint(self.grounding_jitter_min, cap)
         height, width = image.shape[-2:]
         if cap > 0 and max(height, width) > cap:
@@ -165,8 +166,13 @@ class ConditioningModels:
         return to_pil_image(image)
 
     @torch.no_grad()
-    def encode_prompt(self, prompt: str, references: list[torch.Tensor]):
-        images = [self._grounding_pil(image) for image in references]
+    def encode_prompt(
+        self,
+        prompt: str,
+        references: list[torch.Tensor],
+        grounding_jitter: bool = True,
+    ):
+        images = [self._grounding_pil(image, grounding_jitter) for image in references]
         vision = "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
         text = PROMPT_TEMPLATE_ENCODE_PREFIX + vision + prompt + PROMPT_TEMPLATE_ENCODE_SUFFIX
         inputs = self.processor(text=[text], images=images, return_tensors="pt").to(self.device)
@@ -179,13 +185,23 @@ class ConditioningModels:
         return hidden[input_ids != image_token_id].to(self.dtype)
 
     @torch.no_grad()
-    def encode_image(self, image: torch.Tensor):
+    def encode_image(self, image: torch.Tensor, sample_posterior: bool = True):
         pixels = image.to(self.device, self.dtype, non_blocking=True).mul(2).sub(1).unsqueeze(0).unsqueeze(2)
-        latent = self.vae.encode(pixels).latent_dist.sample()
+        posterior = self.vae.encode(pixels).latent_dist
+        latent = posterior.sample() if sample_posterior else posterior.mode()
         mean = torch.tensor(self.vae.config.latents_mean, device=self.device, dtype=self.dtype)
         std = torch.tensor(self.vae.config.latents_std, device=self.device, dtype=self.dtype)
         latent = (latent - mean.view(1, -1, 1, 1, 1)) / std.view(1, -1, 1, 1, 1)
         return latent[0, :, 0]
+
+    @torch.no_grad()
+    def decode_image(self, latent: torch.Tensor):
+        latent = latent.to(self.device, self.dtype).unsqueeze(0).unsqueeze(2)
+        mean = torch.tensor(self.vae.config.latents_mean, device=self.device, dtype=self.dtype)
+        std = torch.tensor(self.vae.config.latents_std, device=self.device, dtype=self.dtype)
+        latent = latent * std.view(1, -1, 1, 1, 1) + mean.view(1, -1, 1, 1, 1)
+        image = self.vae.decode(latent).sample[0, :, 0]
+        return image.float().clamp(-1.0, 1.0).add(1.0).div(2.0)
 
 
 def latent_tokens(latent: torch.Tensor, patch: int, frame: int):

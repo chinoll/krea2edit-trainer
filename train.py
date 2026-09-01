@@ -26,6 +26,7 @@ from krea2edit.svdquant import (
     convert_forward_svdquant_checkpoint,
     load_dual_svdquant_linears,
 )
+from krea2edit.sampling import PreviewDatasetView, generate_previews
 from krea2edit.timesteps import sample_timesteps
 
 
@@ -71,6 +72,45 @@ def save_checkpoint(accelerator, model, output_dir: Path, step: int):
             adapter_dir / "adapter_model.safetensors",
             checkpoint / "krea2edit_comfyui.safetensors",
         )
+    accelerator.wait_for_everyone()
+
+
+def run_previews(
+    accelerator,
+    model,
+    conditioning,
+    dataset,
+    config,
+    output_dir: Path,
+    step: int,
+    logging_backend,
+):
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        results = generate_previews(
+            accelerator.unwrap_model(model),
+            conditioning,
+            dataset,
+            config,
+            output_dir,
+            step,
+        )
+        accelerator.print(
+            f"step={step} samples="
+            + ", ".join(str(path) for _, path in results)
+        )
+        if logging_backend == "wandb" and results:
+            import wandb
+
+            accelerator.log(
+                {
+                    "samples/previews": [
+                        wandb.Image(str(path), caption=sample_id)
+                        for sample_id, path in results
+                    ]
+                },
+                step=step,
+            )
     accelerator.wait_for_everyone()
 
 
@@ -170,6 +210,17 @@ def main():
 
     conditioning = ConditioningModels(config["model"], dtype, accelerator.device)
     accelerator.init_trackers(config["project_name"], config=config)
+    sample_config = config.get("sample", {})
+    sampling_enabled = bool(sample_config.get("enabled", False))
+    sample_dataset = None
+    if sampling_enabled and accelerator.is_main_process:
+        preview_source = EditManifestDataset(
+            sample_config["manifest"], int(config["data"]["max_image_pixels"])
+        )
+        sample_dataset = PreviewDatasetView(
+            preview_source,
+            [sample["id"] for sample in sample_config["samples"]],
+        )
     if accelerator.is_main_process:
         te_quantization = config["model"]["quantization"]["text_encoder"]
         accelerator.print(
@@ -180,6 +231,11 @@ def main():
             f"te_quant_backend={te_quantization['backend']} "
             f"te_quant_weights={te_quantization.get('weights', 'n/a')}"
         )
+        if sampling_enabled:
+            accelerator.print(
+                f"sample_every={sample_config['every']} "
+                f"sample_count={len(sample_config['samples'])}"
+            )
 
     global_step = 0
     resume_from = train_config.get("resume_from")
@@ -263,6 +319,20 @@ def main():
                     )
                 if global_step % int(train_config["save_every"]) == 0:
                     save_checkpoint(accelerator, model, output_dir, global_step)
+                if (
+                    sampling_enabled
+                    and global_step % int(sample_config["every"]) == 0
+                ):
+                    run_previews(
+                        accelerator,
+                        model,
+                        conditioning,
+                        sample_dataset,
+                        sample_config,
+                        output_dir,
+                        global_step,
+                        config["logging"].get("backend"),
+                    )
                 if global_step >= int(train_config["steps"]):
                     break
 
