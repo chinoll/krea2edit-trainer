@@ -10,6 +10,7 @@ from numbers import Integral
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 
 DEFAULT_MODEL_PATHS = {
@@ -193,8 +194,7 @@ class PerceptualFeatureLoss(nn.Module):
     """One frozen perceptual feature extractor.
 
     DINOv2 follows the public PFM all-layer normalized feature distance. DINOv3
-    uses the same distance over spatial patch tokens. TIPSv2 compares its final
-    spatial patch features.
+    and TIPSv2 use the same all-layer distance over spatial patch tokens.
     """
 
     def __init__(
@@ -398,8 +398,17 @@ class PerceptualFeatureLoss(nn.Module):
     def _tipsv2_states(self, image: torch.Tensor):
         # The public encode_image convenience method is no-grad. Calling the
         # frozen vision tower directly keeps gradients with respect to image.
-        _, _, patch_tokens = self.model(image.add(1.0).div(2.0))
-        return (patch_tokens,)
+        # Its intermediate-layer API normalizes every block output and removes
+        # CLS/register tokens, leaving only spatial patch tokens.
+        return tuple(
+            self.model.get_intermediate_layers(
+                image.add(1.0).div(2.0),
+                n=self.model.n_blocks,
+                reshape=False,
+                return_class_token=False,
+                norm=True,
+            )
+        )
 
     def _feature_states(self, image: torch.Tensor):
         if self.name == "tipsv2":
@@ -475,12 +484,18 @@ class PerceptualFeatureLoss(nn.Module):
 class PerceptualLossEnsemble(nn.Module):
     """Absolute weighted sum of one or more frozen feature distances."""
 
-    def __init__(self, backbones: list[dict]):
+    def __init__(
+        self,
+        backbones: list[dict],
+        gradient_checkpointing: bool = True,
+    ):
         super().__init__()
         if not isinstance(backbones, list) or not backbones:
             raise ValueError(
                 "train.loss.perceptual_backbones must be a non-empty list"
             )
+        if not isinstance(gradient_checkpointing, bool):
+            raise TypeError("gradient_checkpointing must be a boolean")
 
         modules = []
         weights = []
@@ -529,6 +544,7 @@ class PerceptualLossEnsemble(nn.Module):
             )
         self.backbones = nn.ModuleList(modules)
         self.weights = tuple(weights)
+        self.gradient_checkpointing = gradient_checkpointing
         self.requires_grad_(False).eval()
 
     def train(self, mode: bool = True):
@@ -562,5 +578,22 @@ class PerceptualLossEnsemble(nn.Module):
 
         total = predictions[0].new_zeros((), dtype=torch.float32)
         for weight, backbone in zip(self.weights, self.backbones):
-            total = total + weight * backbone(predictions, targets).float()
+            if self.gradient_checkpointing:
+                image_count = len(predictions)
+
+                def checkpointed_backbone(*images, module=backbone):
+                    return module(
+                        images[:image_count],
+                        images[image_count:],
+                    )
+
+                backbone_loss = activation_checkpoint(
+                    checkpointed_backbone,
+                    *predictions,
+                    *targets,
+                    use_reentrant=False,
+                )
+            else:
+                backbone_loss = backbone(predictions, targets)
+            total = total + weight * backbone_loss.float()
         return total

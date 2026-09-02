@@ -67,6 +67,8 @@ train:
     pixel_type: mse  # mse, l1, huber, charbonnier
     huber_delta: 1.0
     charbonnier_epsilon: 0.001
+    # Checkpoint every predicted VAE decode and every enabled perceptual
+    # backbone independently. Models remain frozen and in eval mode.
     gradient_checkpointing: true
     perceptual_dtype: bf16  # bf16 or fp32; intentionally independent of model.dtype
     # Absolute weights are not normalized. A zero-weight model is not loaded.

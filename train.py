@@ -536,7 +536,10 @@ def main():
     perceptual_criterion = None
     if configured_loss_weights["perceptual"] > 0.0:
         perceptual_criterion = PerceptualLossEnsemble(
-            configured_loss["perceptual_backbones"]
+            configured_loss["perceptual_backbones"],
+            gradient_checkpointing=configured_loss[
+                "gradient_checkpointing"
+            ],
         ).to(
             device=accelerator.device,
             dtype=torch_dtype(configured_loss["perceptual_dtype"]),
@@ -763,26 +766,10 @@ def main():
                             torch.stack(pixel_losses).mean()
                         )
                     if configured_loss_weights["perceptual"] > 0.0:
-                        if configured_loss["gradient_checkpointing"]:
-                            image_count = len(decoded_predictions)
-
-                            def checkpointed_perceptual(*images):
-                                return perceptual_criterion(
-                                    images[:image_count],
-                                    images[image_count:],
-                                )
-
-                            perceptual_value = activation_checkpoint(
-                                checkpointed_perceptual,
-                                *decoded_predictions,
-                                *pixel_targets,
-                                use_reentrant=False,
-                            )
-                        else:
-                            perceptual_value = perceptual_criterion(
-                                decoded_predictions,
-                                pixel_targets,
-                            )
+                        perceptual_value = perceptual_criterion(
+                            decoded_predictions,
+                            pixel_targets,
+                        )
                         loss = (
                             loss
                             + configured_loss_weights["perceptual"]

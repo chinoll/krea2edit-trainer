@@ -266,8 +266,8 @@ H/W 分组，每个尺寸组执行一次编码，不会在训练循环中逐图�
 
 `name` 支持 `tipsv2`、`dinov2`（别名 `dino2`）、`dinov3`（别名 `dino3`）和
 `vgg`，可按任意顺序组合；`weight: 0` 的条目完全不会加载。DINOv2 保留公开 PFM
-实现的全层 normalized feature MSE。DINOv3 使用同一全层距离，但只比较 spatial
-patch tokens；TIPSv2 使用最终 spatial patch tokens。后两项是本项目将
+实现的全层 normalized feature MSE。DINOv3 和 TIPSv2 使用同一全层距离，但只比较
+spatial patch tokens（不含 CLS/register tokens）。后两项是本项目将
 视觉 backbone 用作感知特征的适配，不应理解为上游发布的校准 perceptual metric。
 
 内置范围以具体权重见过的训练 crop 为依据，而不是模型结构能够前向的极限：
@@ -293,6 +293,11 @@ self-attention 的矩阵规模约为 1/16/81 倍，因此感知 loss 使用 512 
 
 感知网络精度独立于 DiT，默认使用 BF16；如需更高数值精度可设为 FP32，不允许使用
 容易令小特征差下溢的 FP16。
+
+`train.loss.gradient_checkpointing: true` 会分别 checkpoint 每个 prediction VAE
+decode，以及每个非零权重的 perceptual backbone。TIPSv2、DINOv2、DINOv3 和 VGG
+即使保持冻结的 eval 状态，也会各自在独立 checkpoint 边界内执行；target 特征仍在
+`no_grad` 下计算。该选项节省反向激活但不减少常驻模型权重。
 
 示例中的 `1.0 / 0.1 / 0.1` 是混合目标的保守起点，并不是 PFM 论文给出的混合权重。
 论文原方法用 PFM 替换 FM，而不是把它作为辅助项。把 `perceptual` 设为非零时，首次
