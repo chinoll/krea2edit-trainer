@@ -30,10 +30,11 @@ reference images + edit prompt
 ```
 
 参考图和目标图各自从 `(0,0)` 开始生成二维 RoPE 网格，没有位置编码层面的
-crop、padding 或目标图坐标偏移。数据加载阶段会让 target 与 `role: source` 的编辑
-输入共用透明裁剪框和最终缩放尺寸，保持逐像素几何一致；其他辅助参考图独立执行
-透明裁剪与单图像素范围约束。所有结果最后轻微缩放到 16px 网格，辅助参考图仍可
-使用任意比例和分辨率。
+padding 或目标图坐标偏移。数据加载阶段让 target 与 `role: source` 的编辑输入
+始终使用同一个等比缩放系数；它们原始比例可以不同，最终 H/W 也可以不同。若组内
+含 RGBA 图，则会先在归一化画布坐标中做共同的透明内容裁剪，再共同缩放；RGB 图
+视为整张画布有效，不会被透明裁剪。其他辅助参考图独立执行透明裁剪与单图像素范围
+约束。所有结果最后轻微缩放到 16px 网格，辅助参考图仍可使用任意比例和分辨率。
 
 ## Ragged batch 与注意力后端
 
@@ -97,9 +98,10 @@ Krea 2 RAW 为 gated model，需要先在 Hugging Face 接受许可，并设置 
 - `target.image`：监督目标图。
 - `target.caption` 或 `target.prompt`：编辑指令。
 - `references`：一张或多张参考图，数组顺序就是传给 ComfyUI 节点的参考图顺序。
-- `references[].role: source`：与 target 像素对齐的编辑输入。它必须和 target 具有
-  相同的原始画布尺寸，并与 target 共用裁剪框和最终缩放尺寸。
-- `references[].role: reference`：身份、风格等不要求像素对齐的辅助参考，独立处理
+- `references[].role: source`：被编辑前的输入图。它与 target 使用同一个等比缩放系数；
+  若组内存在 RGBA 图，先共同裁掉透明冗余区域，再缩放。不填充、不做非等比拉伸；原始
+  画布比例不同也允许，因此两张图最终分辨率可以不同。缩放后各自轻微对齐到 16px 网格。
+- `references[].role: reference`：身份、风格等不要求共享缩放比例的辅助参考，独立处理
   尺寸。为兼容旧 manifest，省略 `role` 时第一张 reference 默认为 `source`，后续
   reference 默认为 `reference`；新数据建议始终显式填写。
 
@@ -111,24 +113,24 @@ RoPE frame 不写入数据：训练时按数组顺序自动分配为 `1..N`。�
 ## 单图像素范围、透明裁剪与任意分辨率
 
 `data.min_image_pixels` 和 `data.max_image_pixels` 同时作用于 target 与所有
-reference，不限制一条样本内所有参考图的像素总和。target 与 `role: source` 的
-reference 作为一个像素对齐组计算一次最终尺寸；其他 reference 按单张图独立
-计算。普通 RGB 图像同样受最小像素量约束：当 `H × W` 小于下限时按比例放大，
-超过上限时按比例缩小，随后把两个边长轻微缩放到 16 的倍数。两个值分别设为
-`0` 可以关闭对应的下限或上限。
+reference，不限制一条样本内所有参考图的像素总和。target 与 `role: source`
+reference 作为一个缩放组计算同一个等比系数；其他 reference 按单张图独立计算。
+普通 RGB 图像同样受最小像素量约束：当 `H × W` 小于下限时按比例放大，超过上限时
+按比例缩小，随后把两个边长轻微缩放到 16 的倍数。两个值分别设为 `0` 可以关闭
+对应的下限或上限。
 
 RGBA 图像在缩放前执行以下处理：
 
 1. 将 `alpha <= data.alpha_transparency_threshold` 的像素视为完全透明；alpha 与阈值
    均使用 `0..255`，默认阈值 `8` 用于过滤透明通道的数值抖动。
-2. 对 target 与所有 `role: source` 图像计算非透明内容包围盒的并集，再从四边使用
-   同一个并集框向内裁剪；辅助 reference 使用自己的包围盒。像素对齐组中只要有
-   一张普通 RGB 图，就将它视为整张画布均不透明，因此保留完整共享画布。
-3. 若包围盒面积小于 `data.min_image_pixels`，在原图边界内围绕内容向外扩展，直至
-   裁剪面积达到下限；如果整张原图本身仍小于下限，则保留整张图并在下一步等比
-   放大。
-4. target 与 `role: source` 使用完全相同的裁剪框、插值坐标和最终 H/W；辅助
-   reference 独立缩放。
+2. 对 target 与所有 `role: source` 图像分别计算非透明内容包围盒，再映射到归一化
+   画布坐标取并集；从 target 的并集框向外扩展后，把同一个相对裁剪框应用到整个组。
+   辅助 reference 使用自己的包围盒。组中只要有一张普通 RGB 图，就将它视为整张
+   画布均不透明，因此保留完整共享画布。
+3. 若 target 的包围盒面积小于 `data.min_image_pixels`，在 target 原图边界内围绕内容
+   向外扩展；如果整张原图本身仍小于下限，则保留整张图并在下一步等比放大。
+4. 裁剪后的 target 与 `role: source` 始终使用完全相同的等比缩放系数；原始比例可以
+   不同，因此对齐 16px 网格后的最终 H/W 也可以不同。辅助 reference 独立缩放。
 5. 裁剪前先稳定 alpha；裁剪后将剩余透明和半透明区域合成到纯白背景、删除 alpha
    通道，再执行共享或独立缩放。最终交给模型的图像均为 RGB。
 

@@ -147,6 +147,23 @@ class ConditioningModels:
         self.vae_scale_factor = int(config.get("vae_scale_factor", 8))
         self.grounding_max_px = int(config.get("grounding_max_px", 768))
         self.grounding_jitter_min = int(config.get("grounding_jitter_min", 384))
+        self.max_prompt_tokens = int(config.get("max_prompt_tokens", 512))
+
+    def _truncate_prompt(self, prompt: str) -> str:
+        if self.max_prompt_tokens <= 0:
+            return prompt
+        input_ids = self.processor.tokenizer(
+            prompt,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_prompt_tokens,
+            padding=False,
+        )["input_ids"]
+        return self.processor.tokenizer.decode(
+            input_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
 
     def _grounding_pil(self, image: torch.Tensor, jitter: bool = True):
         from torchvision.transforms.functional import to_pil_image
@@ -174,7 +191,12 @@ class ConditioningModels:
     ):
         images = [self._grounding_pil(image, grounding_jitter) for image in references]
         vision = "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
-        text = PROMPT_TEMPLATE_ENCODE_PREFIX + vision + prompt + PROMPT_TEMPLATE_ENCODE_SUFFIX
+        text = (
+            PROMPT_TEMPLATE_ENCODE_PREFIX
+            + vision
+            + self._truncate_prompt(prompt)
+            + PROMPT_TEMPLATE_ENCODE_SUFFIX
+        )
         inputs = self.processor(text=[text], images=images, return_tensors="pt").to(self.device)
         output = self.text_encoder.model(**inputs, output_hidden_states=True, use_cache=False)
         hidden = torch.stack([output.hidden_states[index] for index in SELECT_LAYERS], dim=2)[0]

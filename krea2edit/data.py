@@ -10,6 +10,7 @@ from torchvision.transforms.functional import pil_to_tensor
 from tqdm.auto import tqdm
 
 
+
 def training_grid_size(
     height: int,
     width: int,
@@ -152,38 +153,103 @@ def load_pil_image(path: Path):
         return source.copy()
 
 
+def _normalized_box(box: tuple[int, int, int, int], image: Image.Image):
+    left, top, right, bottom = box
+    return (
+        left / image.width,
+        top / image.height,
+        right / image.width,
+        bottom / image.height,
+    )
+
+
+def _crop_box_from_normalized(
+    box: tuple[float, float, float, float], image: Image.Image
+):
+    left, top, right, bottom = box
+    left = min(image.width - 1, max(0, math.floor(left * image.width)))
+    top = min(image.height - 1, max(0, math.floor(top * image.height)))
+    right = max(left + 1, min(image.width, math.ceil(right * image.width)))
+    bottom = max(top + 1, min(image.height, math.ceil(bottom * image.height)))
+    return left, top, right, bottom
+
+
+def crop_aligned_alpha_images(images: list[Image.Image], min_pixels: int):
+    """Use one normalized alpha-content crop for target + source images."""
+    boxes = []
+    for image in images:
+        box = content_box(image)
+        if box is not None:
+            boxes.append((box, image))
+    if not boxes:
+        return images
+
+    normalized_boxes = [_normalized_box(box, image) for box, image in boxes]
+    union_box = (
+        min(box[0] for box in normalized_boxes),
+        min(box[1] for box in normalized_boxes),
+        max(box[2] for box in normalized_boxes),
+        max(box[3] for box in normalized_boxes),
+    )
+    target_box = _crop_box_from_normalized(union_box, images[0])
+    target_crop = _expanded_crop_box(target_box, images[0].size, min_pixels)
+    normalized_crop = _normalized_box(target_crop, images[0])
+    return [
+        image.crop(_crop_box_from_normalized(normalized_crop, image))
+        for image in images
+    ]
+
+
 def prepare_aligned_images(
     images: list[Image.Image],
     min_pixels: int,
     max_pixels: int,
     alpha_transparency_threshold: int,
 ):
-    """Apply one crop box and one resize geometry to target + aligned sources."""
+    """Jointly crop RGBA pairs, then apply one uniform scale without distortion."""
     images = [
         threshold_alpha(image, alpha_transparency_threshold) for image in images
     ]
-    canvas_size = images[0].size
-    if any(image.size != canvas_size for image in images[1:]):
-        raise ValueError("target and role=source references must have identical canvas sizes")
+    if any("A" in image.getbands() for image in images):
+        images = crop_aligned_alpha_images(images, min_pixels)
 
-    boxes = [box for image in images if (box := content_box(image)) is not None]
-    if boxes:
-        union_box = (
-            min(box[0] for box in boxes),
-            min(box[1] for box in boxes),
-            max(box[2] for box in boxes),
-            max(box[3] for box in boxes),
-        )
-        crop_box = _expanded_crop_box(union_box, canvas_size, min_pixels)
-        images = [image.crop(crop_box) for image in images]
-
-    height, width = training_grid_size(
-        images[0].height,
-        images[0].width,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
+    areas = [image.width * image.height for image in images]
+    lower_scale = (
+        math.sqrt(min_pixels / min(areas)) if min_pixels > 0 else 0.0
     )
-    return [resize_to_size(image_to_tensor(image), height, width) for image in images]
+    upper_scale = (
+        math.sqrt(max_pixels / max(areas)) if max_pixels > 0 else float("inf")
+    )
+    if lower_scale <= upper_scale:
+        scale = min(max(1.0, lower_scale), upper_scale)
+    else:
+        # A shared scale cannot satisfy both bounds. Keep the group under the
+        # maximum pixel budget rather than expanding a large source further.
+        scale = upper_scale
+
+    tensors = []
+    for image in images:
+        height = max(16, int(image.height * scale) // 16 * 16)
+        width = max(16, int(image.width * scale) // 16 * 16)
+        tensors.append(resize_to_size(image_to_tensor(image), height, width))
+    return tensors
+
+
+def prepare_image(
+    source: Image.Image,
+    min_pixels: int,
+    max_pixels: int,
+    alpha_transparency_threshold: int,
+):
+    if "A" in source.getbands():
+        image = crop_and_flatten_alpha(
+            source, min_pixels, alpha_transparency_threshold
+        )
+    else:
+        image = source.convert("RGB")
+    return resize_to_training_grid(
+        image_to_tensor(image), min_pixels, max_pixels
+    )
 
 
 def load_image(
@@ -192,15 +258,12 @@ def load_image(
     max_pixels: int,
     alpha_transparency_threshold: int,
 ):
-    source = load_pil_image(path)
-    if "A" in source.getbands():
-        image = crop_and_flatten_alpha(
-            source, min_pixels, alpha_transparency_threshold
-        )
-    else:
-        image = source.convert("RGB")
-    tensor = image_to_tensor(image)
-    return resize_to_training_grid(tensor, min_pixels, max_pixels)
+    return prepare_image(
+        load_pil_image(path),
+        min_pixels,
+        max_pixels,
+        alpha_transparency_threshold,
+    )
 
 
 class EditManifestDataset(Dataset):
@@ -268,26 +331,26 @@ class EditManifestDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        aligned_indices = [
+        source_indices = [
             reference_index
             for reference_index, reference in enumerate(sample["references"])
             if reference["role"] == "source"
         ]
         references = [None] * len(sample["references"])
 
-        if aligned_indices:
+        if source_indices:
             aligned_images = prepare_aligned_images(
                 [load_pil_image(sample["target"])]
                 + [
                     load_pil_image(sample["references"][reference_index]["image"])
-                    for reference_index in aligned_indices
+                    for reference_index in source_indices
                 ],
                 self.min_image_pixels,
                 self.max_image_pixels,
                 self.alpha_transparency_threshold,
             )
             target = aligned_images[0]
-            for reference_index, image in zip(aligned_indices, aligned_images[1:]):
+            for reference_index, image in zip(source_indices, aligned_images[1:]):
                 references[reference_index] = image
         else:
             target = load_image(

@@ -426,6 +426,13 @@ def main():
                     grad_norm = accelerator.clip_grad_norm_(
                         model.parameters(), float(train_config["max_grad_norm"])
                     )
+                    muon_update_norm = None
+                    if use_deepspeed_muon:
+                        muon_update_norm = getattr(
+                            accelerator.deepspeed_engine_wrapped.engine.optimizer,
+                            "_muon_update_norm",
+                            None,
+                        )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -443,6 +450,8 @@ def main():
                     "train/grad_norm": float(grad_norm),
                     "train/lr": learning_rates[0],
                 }
+                if muon_update_norm is not None:
+                    metrics["train/muon_update_norm_pre_clip"] = float(muon_update_norm)
                 if use_deepspeed_muon:
                     for group_name, learning_rate in zip(
                         optimizer_group_names, learning_rates
@@ -453,10 +462,13 @@ def main():
                             metrics["train/lr_adam"] = learning_rate
                 accelerator.log(metrics, step=global_step)
                 if global_step % int(train_config["log_every"]) == 0:
-                    accelerator.print(
+                    log_line = (
                         f"step={global_step} loss={mean_loss:.6f} "
                         f"grad_norm={float(grad_norm):.6f}"
                     )
+                    if muon_update_norm is not None:
+                        log_line += f" muon_update_norm_pre_clip={float(muon_update_norm):.6f}"
+                    accelerator.print(log_line)
                 if global_step % int(train_config["save_every"]) == 0:
                     save_checkpoint(accelerator, model, output_dir, global_step)
                 if (
