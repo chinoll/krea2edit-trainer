@@ -4,11 +4,13 @@ accelerate>=1.8
 deepspeed>=0.19.6
 diffusers>=0.35
 transformers>=4.57
+sentencepiece
 peft>=0.17
 optimum-quanto>=0.2.4
 safetensors
 huggingface-hub
 einops
+lpips
 Pillow
 PyYAML
 orjson

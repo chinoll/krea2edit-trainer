@@ -43,6 +43,62 @@ train:
   steps: 2000
   gradient_accumulation: 1
   gradient_checkpointing: true
+  # mode is deterministic; independent_sample samples every VAE posterior separately.
+  vae_latent_strategy: mode
+  # These values are sampling weights, not loss multipliers.
+  branch_sampling_weights:
+    edit: 0.75
+    instruction_dropout: 0.10
+    noop: 0.15
+  noop_prompts:
+    - "Keep the image exactly unchanged."
+    - "Make no changes to the image."
+    - "Preserve the image exactly as it is."
+    - "Return the image without any edits."
+    - "Leave every visual detail unchanged."
+    - "Do not alter anything in the image."
+  # Independent coefficients: set any item to 0 to disable it. The largest
+  # active coefficient is effectively the primary objective.
+  loss:
+    weights:
+      fm: 1.0
+      perceptual: 0.1
+      pixel: 0.1
+    pixel_type: mse  # mse, l1, huber, charbonnier
+    huber_delta: 1.0
+    charbonnier_epsilon: 0.001
+    gradient_checkpointing: true
+    perceptual_dtype: bf16  # bf16 or fp32; intentionally independent of model.dtype
+    # Absolute weights are not normalized. A zero-weight model is not loaded.
+    # input_size is configured independently per backbone. Prediction and
+    # target are both resized directly to it. Remove input_size from one entry
+    # to use that backbone's aspect-preserving min/max range fitting instead.
+    # Fixed H/W must be inside min/max and divisible by the model patch size.
+    perceptual_backbones:
+      - name: tipsv2
+        model_path: google/tipsv2-b14
+        input_size: 448
+        min_input_size: 224
+        max_input_size: 448
+        weight: 0.0
+      - name: dinov2
+        model_path: facebook/dinov2-base
+        input_size: 518
+        min_input_size: 224
+        max_input_size: 518
+        weight: 1.0
+      - name: dinov3
+        model_path: facebook/dinov3-vits16-pretrain-lvd1689m
+        # Main global crop: 256. High-resolution phase: 512/768.
+        input_size: 512
+        min_input_size: 256
+        max_input_size: 768
+        weight: 0.0
+      - name: vgg
+        input_size: 224
+        min_input_size: 64
+        max_input_size: 224
+        weight: 1.0
   # adamw, adamw8bit, deepspeed_muon
   optimizer: adamw8bit
   lr: 0.0001

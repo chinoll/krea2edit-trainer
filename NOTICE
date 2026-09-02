@@ -9,6 +9,17 @@ https://github.com/krea-ai/krea-2 (Apache License 2.0).
 The weighted timestep loss table in krea2edit/timesteps.py is adapted from
 https://github.com/ostris/ai-toolkit (MIT License).
 
+The decoded perceptual flow-matching objective and its VGG/DINOv2 feature
+distances in krea2edit/perceptual.py are adapted from
+https://github.com/ZhaoChuyang/PFM (Apache License 2.0).
+
+Optional TIPSv2 perceptual features use the TIPSv2 model from
+https://github.com/google-deepmind/tips (Apache License 2.0 for software;
+upstream separately identifies other materials as CC BY 4.0).
+
+Optional DINOv3 perceptual features use models from
+https://github.com/facebookresearch/dinov3 under the DINOv3 License.
+
 Krea 2 RAW model weights are NOT distributed with this software.
 Krea 2 is licensed under the Krea 2 Community License Agreement. For more
 information, visit https://krea.ai/krea-2-licensing.

@@ -141,10 +141,22 @@ class ConditioningModels:
         self.vae = AutoencoderKLQwenImage.from_pretrained(
             config["vae_path"], subfolder="vae", torch_dtype=dtype, token=token
         )
+        vae_config_scale = getattr(
+            self.vae.config, "spatial_compression_ratio", None
+        )
+        configured_scale = config.get("vae_scale_factor", vae_config_scale or 8)
+        self.vae_scale_factor = int(configured_scale)
+        if (
+            vae_config_scale is not None
+            and self.vae_scale_factor != int(vae_config_scale)
+        ):
+            raise ValueError(
+                "model.vae_scale_factor does not match the loaded VAE: "
+                f"{self.vae_scale_factor} != {int(vae_config_scale)}"
+            )
         self.vae.requires_grad_(False).eval().to(device)
         self.dtype = dtype
         self.device = device
-        self.vae_scale_factor = int(config.get("vae_scale_factor", 8))
         self.grounding_max_px = int(config.get("grounding_max_px", 768))
         self.grounding_jitter_min = int(config.get("grounding_jitter_min", 384))
         self.max_prompt_tokens = int(config.get("max_prompt_tokens", 512))
@@ -216,14 +228,18 @@ class ConditioningModels:
         latent = (latent - mean.view(1, -1, 1, 1, 1)) / std.view(1, -1, 1, 1, 1)
         return latent[0, :, 0]
 
-    @torch.no_grad()
-    def decode_image(self, latent: torch.Tensor):
+    def decode_latent_to_pixels(self, latent: torch.Tensor):
+        """Decode one latent to [-1, 1] pixels while preserving input gradients."""
         latent = latent.to(self.device, self.dtype).unsqueeze(0).unsqueeze(2)
         mean = torch.tensor(self.vae.config.latents_mean, device=self.device, dtype=self.dtype)
         std = torch.tensor(self.vae.config.latents_std, device=self.device, dtype=self.dtype)
         latent = latent * std.view(1, -1, 1, 1, 1) + mean.view(1, -1, 1, 1, 1)
         image = self.vae.decode(latent).sample[0, :, 0]
-        return image.float().clamp(-1.0, 1.0).add(1.0).div(2.0)
+        return image.float().clamp(-1.0, 1.0)
+
+    @torch.no_grad()
+    def decode_image(self, latent: torch.Tensor):
+        return self.decode_latent_to_pixels(latent).add(1.0).div(2.0)
 
 
 def latent_tokens(latent: torch.Tensor, patch: int, frame: int):

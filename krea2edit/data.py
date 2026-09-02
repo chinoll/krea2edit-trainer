@@ -374,6 +374,8 @@ class EditManifestDataset(Dataset):
             "prompt": sample["prompt"],
             "target": target,
             "references": references,
+            "source_indices": source_indices,
+            "primary_source_index": source_indices[0] if source_indices else None,
         }
 
 

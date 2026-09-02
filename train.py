@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 import argparse
+import math
+import random
 from pathlib import Path
 
 import torch
@@ -9,6 +11,7 @@ from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import set_seed
 from diffusers.optimization import get_scheduler
 from torch.utils.data import DataLoader
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from tqdm.auto import tqdm
 
 from krea2edit.data import EditManifestDataset, ragged_collate
@@ -23,15 +26,255 @@ from krea2edit.modeling import (
     target_velocity_tokens,
     torch_dtype,
 )
+from krea2edit.perceptual import PerceptualLossEnsemble
 from krea2edit.svdquant import (
     convert_forward_svdquant_checkpoint,
     load_dual_svdquant_linears,
 )
-from krea2edit.sampling import PreviewDatasetView, generate_previews
+from krea2edit.sampling import (
+    PreviewDatasetView,
+    generate_previews,
+    velocity_tokens_to_latent,
+)
 from krea2edit.timesteps import sample_timesteps
 
 
 DEEPSPEED_MUON_NAMES = {"deepspeed_muon", "muon"}
+TRAINING_BRANCHES = ("edit", "instruction_dropout", "noop")
+VAE_LATENT_STRATEGIES = {"mode", "independent_sample"}
+LOSS_NAMES = ("fm", "perceptual", "pixel")
+PIXEL_LOSS_TYPES = {"mse", "l1", "huber", "charbonnier"}
+DEFAULT_PERCEPTUAL_BACKBONES = [
+    {
+        "name": "dinov2",
+        "model_path": "facebook/dinov2-base",
+        "input_size": 518,
+        "min_input_size": 224,
+        "max_input_size": 518,
+        "weight": 1.0,
+    },
+    {
+        "name": "vgg",
+        "input_size": 224,
+        "min_input_size": 64,
+        "max_input_size": 224,
+        "weight": 1.0,
+    },
+]
+
+
+def training_recipe(config: dict):
+    vae_latent_strategy = str(config.get("vae_latent_strategy", "mode"))
+    if vae_latent_strategy not in VAE_LATENT_STRATEGIES:
+        choices = ", ".join(sorted(VAE_LATENT_STRATEGIES))
+        raise ValueError(
+            f"train.vae_latent_strategy must be one of: {choices}"
+        )
+
+    raw_weights = config.get(
+        "branch_sampling_weights",
+        {"edit": 1.0, "instruction_dropout": 0.0, "noop": 0.0},
+    )
+    if not isinstance(raw_weights, dict):
+        raise TypeError("train.branch_sampling_weights must be a mapping")
+    unknown_branches = set(raw_weights) - set(TRAINING_BRANCHES)
+    if unknown_branches:
+        raise ValueError(
+            "unknown train.branch_sampling_weights entries: "
+            + ", ".join(sorted(unknown_branches))
+        )
+
+    branch_weights = {}
+    for branch in TRAINING_BRANCHES:
+        weight = float(raw_weights.get(branch, 0.0))
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError(
+                f"train.branch_sampling_weights.{branch} must be finite and >= 0"
+            )
+        branch_weights[branch] = weight
+    if sum(branch_weights.values()) <= 0.0:
+        raise ValueError("at least one training branch sampling weight must be > 0")
+
+    raw_noop_prompts = config.get("noop_prompts", [])
+    if not isinstance(raw_noop_prompts, list):
+        raise TypeError("train.noop_prompts must be a list")
+    noop_prompts = []
+    for index, prompt in enumerate(raw_noop_prompts):
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(
+                f"train.noop_prompts[{index}] must be a non-empty string"
+            )
+        noop_prompts.append(prompt.strip())
+    if branch_weights["noop"] > 0.0 and not noop_prompts:
+        raise ValueError(
+            "train.noop_prompts must not be empty when the noop branch weight is > 0"
+        )
+
+    return vae_latent_strategy, branch_weights, noop_prompts
+
+
+def choose_training_branch(sample: dict, branch_weights: dict[str, float]):
+    eligible_branches = ["edit", "instruction_dropout"]
+    if sample["primary_source_index"] is not None:
+        eligible_branches.append("noop")
+    eligible_weights = [branch_weights[branch] for branch in eligible_branches]
+    total_weight = sum(eligible_weights)
+    if total_weight <= 0.0:
+        raise ValueError(
+            f"sample {sample['id']!r} has no eligible training branch with positive weight"
+        )
+    return random.choices(eligible_branches, weights=eligible_weights, k=1)[0]
+
+
+def loss_recipe(config: dict):
+    raw_loss = config.get("loss", {})
+    if not isinstance(raw_loss, dict):
+        raise TypeError("train.loss must be a mapping")
+    allowed_entries = {
+        "weights",
+        "pixel_type",
+        "huber_delta",
+        "charbonnier_epsilon",
+        "gradient_checkpointing",
+        "perceptual_dtype",
+        "perceptual_backbones",
+    }
+    unknown_entries = set(raw_loss) - allowed_entries
+    if unknown_entries:
+        raise ValueError(
+            "unknown train.loss entries: " + ", ".join(sorted(unknown_entries))
+        )
+
+    raw_weights = raw_loss.get(
+        "weights", {"fm": 1.0, "perceptual": 0.0, "pixel": 0.0}
+    )
+    if not isinstance(raw_weights, dict):
+        raise TypeError("train.loss.weights must be a mapping")
+    unknown_weights = set(raw_weights) - set(LOSS_NAMES)
+    if unknown_weights:
+        raise ValueError(
+            "unknown train.loss.weights entries: "
+            + ", ".join(sorted(unknown_weights))
+        )
+    loss_weights = {}
+    for name in LOSS_NAMES:
+        weight = float(raw_weights.get(name, 0.0))
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError(
+                f"train.loss.weights.{name} must be finite and >= 0"
+            )
+        loss_weights[name] = weight
+    if sum(loss_weights.values()) <= 0.0:
+        raise ValueError("at least one train.loss weight must be > 0")
+
+    pixel_type = str(raw_loss.get("pixel_type", "mse")).lower()
+    if pixel_type not in PIXEL_LOSS_TYPES:
+        choices = ", ".join(sorted(PIXEL_LOSS_TYPES))
+        raise ValueError(f"train.loss.pixel_type must be one of: {choices}")
+    huber_delta = float(raw_loss.get("huber_delta", 1.0))
+    if not math.isfinite(huber_delta) or huber_delta <= 0.0:
+        raise ValueError("train.loss.huber_delta must be finite and > 0")
+    charbonnier_epsilon = float(raw_loss.get("charbonnier_epsilon", 1e-3))
+    if not math.isfinite(charbonnier_epsilon) or charbonnier_epsilon <= 0.0:
+        raise ValueError(
+            "train.loss.charbonnier_epsilon must be finite and > 0"
+        )
+    gradient_checkpointing = raw_loss.get("gradient_checkpointing", True)
+    if not isinstance(gradient_checkpointing, bool):
+        raise TypeError("train.loss.gradient_checkpointing must be a boolean")
+    perceptual_dtype = str(raw_loss.get("perceptual_dtype", "bf16")).lower()
+    if perceptual_dtype not in {"bf16", "fp32"}:
+        raise ValueError(
+            "train.loss.perceptual_dtype must be bf16 or fp32"
+        )
+    perceptual_backbones = raw_loss.get(
+        "perceptual_backbones", DEFAULT_PERCEPTUAL_BACKBONES
+    )
+    if loss_weights["perceptual"] > 0.0:
+        if not isinstance(perceptual_backbones, list) or not perceptual_backbones:
+            raise ValueError(
+                "train.loss.perceptual_backbones must be a non-empty list "
+                "when perceptual loss is enabled"
+            )
+
+    return {
+        "weights": loss_weights,
+        "pixel_type": pixel_type,
+        "huber_delta": huber_delta,
+        "charbonnier_epsilon": charbonnier_epsilon,
+        "gradient_checkpointing": gradient_checkpointing,
+        "perceptual_dtype": perceptual_dtype,
+        "perceptual_backbones": perceptual_backbones,
+    }
+
+
+def pixel_space_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    loss_type: str,
+    huber_delta: float,
+    charbonnier_epsilon: float,
+):
+    prediction = prediction.float()
+    target = target.float()
+    if loss_type == "mse":
+        return F.mse_loss(prediction, target)
+    if loss_type == "l1":
+        return F.l1_loss(prediction, target)
+    if loss_type == "huber":
+        return F.huber_loss(prediction, target, delta=huber_delta)
+    difference = prediction - target
+    return torch.sqrt(
+        difference.square() + charbonnier_epsilon * charbonnier_epsilon
+    ).mean()
+
+
+def decode_flow_endpoints(
+    conditioning,
+    predictions: list[torch.Tensor],
+    noisy_targets: list[torch.Tensor],
+    target_images: list[torch.Tensor],
+    timesteps: torch.Tensor,
+    patch: int,
+    use_gradient_checkpointing: bool,
+):
+    predicted_pixels = []
+    target_pixels = []
+    for prediction, noisy, target_image, timestep in zip(
+        predictions, noisy_targets, target_images, timesteps
+    ):
+        velocity = velocity_tokens_to_latent(
+            prediction,
+            noisy.shape[-2],
+            noisy.shape[-1],
+            patch,
+        )
+        predicted_clean = noisy.float() - timestep.float() * velocity.float()
+        if use_gradient_checkpointing:
+            decoded_prediction = activation_checkpoint(
+                conditioning.decode_latent_to_pixels,
+                predicted_clean,
+                use_reentrant=False,
+            )
+        else:
+            decoded_prediction = conditioning.decode_latent_to_pixels(
+                predicted_clean
+            )
+        with torch.no_grad():
+            decoded_target = target_image.to(
+                device=decoded_prediction.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            ).mul(2.0).sub(1.0)
+            if decoded_target.shape != decoded_prediction.shape:
+                raise RuntimeError(
+                    "decoded prediction and pre-encode target must have identical "
+                    f"C/H/W, got {tuple(decoded_prediction.shape)} and "
+                    f"{tuple(decoded_target.shape)}"
+                )
+        predicted_pixels.append(decoded_prediction)
+        target_pixels.append(decoded_target)
+    return predicted_pixels, target_pixels
 
 
 def parse_args():
@@ -224,6 +467,16 @@ def main():
 
     config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     train_config = config["train"]
+    vae_latent_strategy, branch_sampling_weights, noop_prompts = training_recipe(
+        train_config
+    )
+    configured_loss = loss_recipe(train_config)
+    configured_loss_weights = configured_loss["weights"]
+    decoded_loss_enabled = (
+        configured_loss_weights["perceptual"] > 0.0
+        or configured_loss_weights["pixel"] > 0.0
+    )
+    sample_vae_posterior = vae_latent_strategy == "independent_sample"
     optimizer_name = str(train_config["optimizer"]).lower()
     use_deepspeed_muon = optimizer_name in DEEPSPEED_MUON_NAMES
     if use_deepspeed_muon and not config["distributed"]["deepspeed_zero2"]:
@@ -253,7 +506,9 @@ def main():
         log_with=config["logging"].get("backend"),
         project_dir=config["output_dir"],
     )
-    set_seed(int(config["seed"]))
+    seed = int(config["seed"])
+    set_seed(seed)
+    random.seed(seed + accelerator.process_index)
 
     output_dir = Path(config["output_dir"])
     if accelerator.is_main_process:
@@ -278,6 +533,14 @@ def main():
     )
 
     dtype = torch_dtype(config["model"]["dtype"])
+    perceptual_criterion = None
+    if configured_loss_weights["perceptual"] > 0.0:
+        perceptual_criterion = PerceptualLossEnsemble(
+            configured_loss["perceptual_backbones"]
+        ).to(
+            device=accelerator.device,
+            dtype=torch_dtype(configured_loss["perceptual_dtype"]),
+        )
     dit = load_dit(config["model"]["dit"], dtype)
     dit_quantization = config["model"]["quantization"]["dit"]
     dit_quantization_backend = dit_quantization["backend"]
@@ -382,23 +645,65 @@ def main():
         )
         for batch in data_progress:
             with accelerator.accumulate(model):
+                branches = [
+                    choose_training_branch(sample, branch_sampling_weights)
+                    for sample in batch
+                ]
+                prompts = []
+                for sample, branch in zip(batch, branches):
+                    if branch == "edit":
+                        prompts.append(sample["prompt"])
+                    elif branch == "instruction_dropout":
+                        prompts.append("")
+                    else:
+                        prompts.append(random.choice(noop_prompts))
+                loss_target_images = []
+                if decoded_loss_enabled:
+                    for sample, branch in zip(batch, branches):
+                        if branch == "noop":
+                            loss_target_images.append(
+                                sample["references"][sample["primary_source_index"]]
+                            )
+                        else:
+                            loss_target_images.append(sample["target"])
                 with torch.no_grad():
                     contexts = [
-                        conditioning.encode_prompt(sample["prompt"], sample["references"])
-                        for sample in batch
+                        conditioning.encode_prompt(prompt, sample["references"])
+                        for sample, prompt in zip(batch, prompts)
                     ]
-                    clean_targets = [conditioning.encode_image(sample["target"]) for sample in batch]
                     reference_latents = [
-                        [conditioning.encode_image(image) for image in sample["references"]]
+                        [
+                            conditioning.encode_image(
+                                image, sample_posterior=sample_vae_posterior
+                            )
+                            for image in sample["references"]
+                        ]
                         for sample in batch
                     ]
+                    clean_targets = []
+                    for sample, branch, sample_reference_latents in zip(
+                        batch, branches, reference_latents
+                    ):
+                        if branch == "noop":
+                            clean_targets.append(
+                                sample_reference_latents[
+                                    sample["primary_source_index"]
+                                ]
+                            )
+                        else:
+                            clean_targets.append(
+                                conditioning.encode_image(
+                                    sample["target"],
+                                    sample_posterior=sample_vae_posterior,
+                                )
+                            )
 
                 patch = accelerator.unwrap_model(model).patch
                 token_counts = [
                     (latent.shape[-2] // patch) * (latent.shape[-1] // patch)
                     for latent in clean_targets
                 ]
-                timesteps, loss_weights = sample_timesteps(
+                timesteps, timestep_loss_weights = sample_timesteps(
                     train_config["timestep_sampling"], len(batch), token_counts, accelerator.device
                 )
                 timesteps = timesteps.to(dtype)
@@ -413,11 +718,76 @@ def main():
                     contexts,
                     timesteps,
                 )
-                losses = [
-                    F.mse_loss(prediction.float(), target_velocity_tokens(clean, noise, patch).float())
-                    for prediction, clean, noise in zip(predictions, clean_targets, noises)
-                ]
-                loss = (torch.stack(losses) * loss_weights).mean()
+                loss = predictions[0].new_zeros((), dtype=torch.float32)
+                if configured_loss_weights["fm"] > 0.0:
+                    fm_losses = [
+                        F.mse_loss(
+                            prediction.float(),
+                            target_velocity_tokens(clean, noise, patch).float(),
+                        )
+                        for prediction, clean, noise in zip(
+                            predictions, clean_targets, noises
+                        )
+                    ]
+                    fm_loss = (
+                        torch.stack(fm_losses) * timestep_loss_weights
+                    ).mean()
+                    loss = loss + configured_loss_weights["fm"] * fm_loss
+
+                if decoded_loss_enabled:
+                    decoded_predictions, pixel_targets = decode_flow_endpoints(
+                        conditioning=conditioning,
+                        predictions=predictions,
+                        noisy_targets=noisy_targets,
+                        target_images=loss_target_images,
+                        timesteps=timesteps,
+                        patch=patch,
+                        use_gradient_checkpointing=configured_loss[
+                            "gradient_checkpointing"
+                        ],
+                    )
+                    if configured_loss_weights["pixel"] > 0.0:
+                        pixel_losses = [
+                            pixel_space_loss(
+                                prediction,
+                                target,
+                                configured_loss["pixel_type"],
+                                configured_loss["huber_delta"],
+                                configured_loss["charbonnier_epsilon"],
+                            )
+                            for prediction, target in zip(
+                                decoded_predictions, pixel_targets
+                            )
+                        ]
+                        loss = loss + configured_loss_weights["pixel"] * (
+                            torch.stack(pixel_losses).mean()
+                        )
+                    if configured_loss_weights["perceptual"] > 0.0:
+                        if configured_loss["gradient_checkpointing"]:
+                            image_count = len(decoded_predictions)
+
+                            def checkpointed_perceptual(*images):
+                                return perceptual_criterion(
+                                    images[:image_count],
+                                    images[image_count:],
+                                )
+
+                            perceptual_value = activation_checkpoint(
+                                checkpointed_perceptual,
+                                *decoded_predictions,
+                                *pixel_targets,
+                                use_reentrant=False,
+                            )
+                        else:
+                            perceptual_value = perceptual_criterion(
+                                decoded_predictions,
+                                pixel_targets,
+                            )
+                        loss = (
+                            loss
+                            + configured_loss_weights["perceptual"]
+                            * perceptual_value
+                        )
                 accumulated_loss += loss.detach()
                 accumulated_micro_steps += 1
 

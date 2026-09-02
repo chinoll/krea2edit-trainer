@@ -138,6 +138,171 @@ RGBA 图像在缩放前执行以下处理：
 训练集和独立 evaluate 数据集使用相同的数据几何。采样输出始终使用预处理后 GT
 target 的 H/W，因此生成图与 GT 完全同尺寸。
 
+## 确定性 VAE 与训练分支
+
+训练默认使用 VAE posterior mode，避免 source、target 和 reference 各自采样 posterior
+引入额外随机差异。`independent_sample` 仅保留为显式对照选项：
+
+```yaml
+train:
+  vae_latent_strategy: mode  # mode | independent_sample
+```
+
+每个数据样本只选择一个训练分支。配置项是分支的**采样权重**，会在当前样本可用的
+分支之间归一化；它们不是 loss multiplier：
+
+```yaml
+train:
+  branch_sampling_weights:
+    edit: 0.75
+    instruction_dropout: 0.10
+    noop: 0.15
+  noop_prompts:
+    - "Keep the image exactly unchanged."
+    - "Make no changes to the image."
+    - "Preserve the image exactly as it is."
+```
+
+- `edit`：使用 manifest 中的编辑指令，clean endpoint 是 target latent。
+- `instruction_dropout`：使用空指令，clean endpoint 仍是 target latent。
+- `noop`：从 `noop_prompts` 均匀随机选择一条指令，clean endpoint 是第一张
+  `role: source` reference 的 latent。该 tensor 直接复用 reference 编码结果，不会
+  再次执行 VAE 编码。
+
+没有 `role: source` 的样本不能进入 `noop`；训练器会移除该分支，再对剩余分支权重
+重新归一化。三种分支共享下述同一组 loss 配置，不增加 branch-specific loss 权重，
+也不增加已排除的 edit/no-op delta consistency。
+
+## 可组合 FM、PFM 与 Pixel Loss
+
+PFM 路径参考 [Perceptual Flow Matching 论文](https://arxiv.org/abs/2607.03524)
+及其[官方实现](https://github.com/ZhaoChuyang/PFM)。
+
+`train.loss.weights` 中三个系数完全独立；设为 `0` 即禁用，因此可以自由组合纯 FM、
+纯 PFM、纯 pixel，或自行决定主项和辅助项：
+
+```yaml
+train:
+  loss:
+    weights:
+      fm: 1.0
+      perceptual: 0.1
+      pixel: 0.1
+    pixel_type: mse  # mse | l1 | huber | charbonnier
+    huber_delta: 1.0
+    charbonnier_epsilon: 0.001
+    gradient_checkpointing: true
+    perceptual_dtype: bf16  # bf16 | fp32
+    perceptual_backbones:
+      - name: tipsv2
+        model_path: google/tipsv2-b14
+        input_size: 448
+        min_input_size: 224
+        max_input_size: 448
+        weight: 0.0
+      - name: dinov2
+        model_path: facebook/dinov2-base
+        input_size: 518
+        min_input_size: 224
+        max_input_size: 518
+        weight: 1.0
+      - name: dinov3
+        model_path: facebook/dinov3-vits16-pretrain-lvd1689m
+        input_size: 512
+        min_input_size: 256
+        max_input_size: 768
+        weight: 0.0
+      - name: vgg
+        input_size: 224
+        min_input_size: 64
+        max_input_size: 224
+        weight: 1.0
+```
+
+所有启用项先使用同一个模型预测。训练器把 ragged velocity tokens 还原为 latent
+velocity，并按 Krea convention 计算：
+
+```text
+x0_prediction = noisy_target - t * predicted_velocity
+```
+
+- `fm`：现有 latent velocity MSE；仅这一项继续使用 timestep loss weighting。
+- `perceptual`：可微分地 VAE decode `x0_prediction`，再组合冻结的 TIPSv2、
+  DINOv2、DINOv3 和 calibrated VGG LPIPS 特征距离。各 backbone 先乘自己的
+  `weight`，其绝对加权和再乘 `weights.perceptual`；内部权重不会自动归一化。
+- `pixel`：在 `[-1, 1]` RGB 空间比较同一张 decode 预测与监督图，支持 MSE、L1、
+  Huber 和 Charbonnier。
+
+按当前实现，监督端直接使用 VAE encode 之前的数据图像，不额外 decode clean
+latent：edit 与 instruction-dropout 使用原 target，noop 使用 primary source。预测端
+VAE decode 必须保留梯度，但 VAE 参数仍冻结；`gradient_checkpointing: true` 会对预测
+decode 和 perceptual encoder 做 activation checkpoint 以降低峰值显存。PFM/pixel
+不会再乘 FM 的 timestep weight。预测 decode 与 encode 前监督图的 C/H/W 必须完全
+一致，否则训练立即报错；loss 路径不会通过 resize 或 padding 隐式兜底。
+
+DiT 数据预处理先按自己的最小/最大像素预算确定训练画布；感知 loss 不复用该预算。
+每个感知 backbone 在 forward 前对 DiT 输出做第二次尺寸检查：若 H/W 已位于自己的
+`min_input_size` 与 `max_input_size` 内就保留原尺度，否则使用一个共同 scale 等比
+放大或缩小，令两条边都进入该闭区间。整数范围同时约束 H/W，也可写成
+`[height, width]` 分别约束两轴。若极端长宽比不存在能同时满足两轴范围的等比 scale，
+会立即报错，不会拉伸图像或裁掉边缘。
+
+等比缩放后，H/W 再分别取到最近的模型 patch 网格（TIPSv2/DINOv2 通常为 14，
+DINOv3 ViT 通常为 16）；取整结果仍保证处于范围内。prediction 与 target 始终共用
+同一个最终尺寸。VGG 没有 ViT patch 边界。
+
+每个 backbone 都可独立设置 `input_size`：整数表示固定 `N×N`，
+`[height, width]` 表示固定矩形尺寸。设置后不再执行等比范围拟合，而是把 prediction
+与 target 一起直接双线性 resize 到该尺寸，因此方形尺寸会拉伸非方形输入；删除某个
+条目的 `input_size` 后，只有该模型恢复上述动态范围模式。固定尺寸仍须位于该模型的
+`min_input_size` / `max_input_size` 内，并且必须已经对齐其 patch 网格；配置不满足时
+直接报错，不会静默修改配置值。范围检查和 prediction/target 同形检查之外，模型不
+支持的配置会由其原生 forward 直接报错，不做额外兜底。
+
+每个样本的 prediction/target 原始 tensor shape 会在任何 resize 之前逐对检查。检查
+通过后才按各 backbone 的最终输入尺寸分组并拼成 batch；固定 `input_size` 时整个
+micro-batch 对该 backbone 只执行一次编码。动态范围模式若解析出多个不同 H/W，则按
+H/W 分组，每个尺寸组执行一次编码，不会在训练循环中逐图调用视觉 backbone。
+
+`name` 支持 `tipsv2`、`dinov2`（别名 `dino2`）、`dinov3`（别名 `dino3`）和
+`vgg`，可按任意顺序组合；`weight: 0` 的条目完全不会加载。DINOv2 保留公开 PFM
+实现的全层 normalized feature MSE。DINOv3 使用同一全层距离，但只比较 spatial
+patch tokens；TIPSv2 使用最终 spatial patch tokens。后两项是本项目将
+视觉 backbone 用作感知特征的适配，不应理解为上游发布的校准 perceptual metric。
+
+内置范围以具体权重见过的训练 crop 为依据，而不是模型结构能够前向的极限：
+
+- TIPSv2 全系列均为 patch 14。低分辨率阶段使用 global/local crop 224/98，高分辨率
+  阶段使用 448/140，蒸馏学生也经历高分辨率阶段。感知 loss 使用整图 spatial
+  features，所以默认采用 global crop 范围 224--448。
+- `facebook/dinov2-base` 的主训练 global/local crop 是 224/98，发布权重随后在 518
+  做高分辨率适配（patch 14）。公开 PFM recipe 也在 518 提取 DINOv2 特征，因此默认
+  global 范围是 224--518。
+- `facebook/dinov3-vits16-pretrain-lvd1689m` 的主训练/蒸馏 global/local crop 是
+  256/112（patch 16）。论文描述的蒸馏学生随后也执行高分辨率阶段（不使用 Gram
+  anchoring），global crop 为 512 或 768，所以默认范围是 256--768。
+- VGG LPIPS 的线性校准使用 64px BAPPS patch，底层 VGG16 的 ImageNet 训练输入为
+  224px，因此该组合默认范围是 64--224。
+
+这些默认上下限会实际参与运行时检查。自定义 checkpoint 如果使用了不同训练范围，
+可在对应条目显式覆盖 `min_input_size` / `max_input_size`；`input_size` 本身也必须落在
+覆盖后的范围内。
+DINOv3 patch-16 在 256/512/768 下分别产生 256/1024/2304 个 spatial tokens，完整
+self-attention 的矩阵规模约为 1/16/81 倍，因此感知 loss 使用 512 或 768 时显存和
+计算量会明显上升。
+
+感知网络精度独立于 DiT，默认使用 BF16；如需更高数值精度可设为 FP32，不允许使用
+容易令小特征差下溢的 FP16。
+
+示例中的 `1.0 / 0.1 / 0.1` 是混合目标的保守起点，并不是 PFM 论文给出的混合权重。
+论文原方法用 PFM 替换 FM，而不是把它作为辅助项。把 `perceptual` 设为非零时，首次
+运行需要预先缓存所有非零权重条目。TIPSv2 默认模型为 `google/tipsv2-b14`；其当前
+Hugging Face 实现通过 `trust_remote_code=True` 加载，但 loss 直接调用冻结的 vision
+tower 以保留对 prediction 的梯度，并释放不使用的 text tower。DINOv3 默认模型
+`facebook/dinov3-vits16-pretrain-lvd1689m` 是 gated 权重，需要先接受其许可并缓存。
+当前启动脚本使用 Hugging Face 离线模式，因此缺失缓存时会直接报错。只需要 pixel
+loss 时可把 `perceptual` 设为 `0`，此时不会加载任何感知模型。
+
 ## DIT 与 TE 独立量化
 
 配置直接指定量化后端，精度是该后端的参数，不再用 `int8` 之类的精度名称代替
