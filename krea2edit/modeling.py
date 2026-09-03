@@ -39,6 +39,8 @@ KREA2_MMDIT_CONFIG = {
     "txtlayers": 12,
 }
 
+LORA_INITIALIZATIONS = {"gaussian", "nora_init"}
+
 
 def torch_dtype(name: str):
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[name]
@@ -80,7 +82,34 @@ def quantize_component(model: nn.Module, config: dict):
     return model
 
 
+@torch.no_grad()
+def apply_nora_init(model: nn.Module, epsilon: float = 1e-12) -> int:
+    """Normalize every LoRA A column along its rank dimension once."""
+    initialized = 0
+    for name, parameter in model.named_parameters():
+        if ".lora_A." not in name or not name.endswith(".weight"):
+            continue
+        if parameter.ndim != 2:
+            raise RuntimeError(
+                f"NoRA-init expected a matrix for {name}, got {tuple(parameter.shape)}"
+            )
+        value = parameter.detach().float()
+        column_norms = torch.linalg.vector_norm(
+            value, ord=2, dim=0, keepdim=True
+        ).clamp_min(epsilon)
+        parameter.copy_((value / column_norms).to(dtype=parameter.dtype))
+        initialized += 1
+    if initialized == 0:
+        raise RuntimeError("NoRA-init found no PEFT LoRA A matrices")
+    return initialized
+
+
 def add_lora(model: SingleStreamDiT, config: dict):
+    initialization = str(config.get("initialization", "gaussian")).lower()
+    initialization = initialization.replace("-", "_")
+    if initialization not in LORA_INITIALIZATIONS:
+        choices = ", ".join(sorted(LORA_INITIALIZATIONS))
+        raise ValueError(f"lora.initialization must be one of: {choices}")
     target_modules = config.get("target_modules", "all-linear")
     if target_modules == "all-linear":
         target_modules = [name for name, module in model.named_modules() if isinstance(module, nn.Linear)]
@@ -92,7 +121,10 @@ def add_lora(model: SingleStreamDiT, config: dict):
         bias="none",
         init_lora_weights="gaussian",
     )
-    return get_peft_model(model, lora)
+    peft_model = get_peft_model(model, lora)
+    if initialization == "nora_init":
+        apply_nora_init(peft_model)
+    return peft_model
 
 
 def export_comfyui_lora(adapter_file: Path, output_file: Path):
@@ -258,10 +290,37 @@ def latent_tokens(latent: torch.Tensor, patch: int, frame: int):
 
 
 class RaggedEditModel(nn.Module):
-    def __init__(self, dit):
+    def __init__(
+        self,
+        dit,
+        representation_projection: str = "none",
+        projection_hidden_dim: int = 1024,
+    ):
         super().__init__()
         self.dit = dit
         self.patch = dit.base_model.model.config.patch
+        self.depth = dit.base_model.model.config.layers
+        self.features = dit.base_model.model.config.features
+        if representation_projection == "none":
+            self.representation_projector = None
+        elif representation_projection == "identity":
+            self.representation_projector = nn.Identity()
+        elif representation_projection == "mlp":
+            if projection_hidden_dim <= 0:
+                raise ValueError("projection_hidden_dim must be > 0")
+            anchor = next(
+                parameter for parameter in dit.parameters()
+                if parameter.requires_grad
+            )
+            self.representation_projector = nn.Sequential(
+                nn.Linear(self.features, projection_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(projection_hidden_dim, self.features),
+            ).to(device=anchor.device, dtype=anchor.dtype)
+        else:
+            raise ValueError(
+                "representation_projection must be none, identity, or mlp"
+            )
 
     def forward(
         self,
@@ -269,6 +328,11 @@ class RaggedEditModel(nn.Module):
         references: list[list[torch.Tensor]],
         contexts: list[torch.Tensor],
         timesteps: torch.Tensor,
+        alternate_timesteps: torch.Tensor | None = None,
+        alternate_target_masks: list[torch.Tensor] | None = None,
+        representation_layer: int | None = None,
+        project_representation: bool = False,
+        return_velocity: bool = True,
     ):
         patch = self.patch
         image_tokens, positions, reference_lengths, target_lengths = [], [], [], []
@@ -294,23 +358,62 @@ class RaggedEditModel(nn.Module):
                 dtype=torch.bool,
                 device=image_tokens[0].device,
             )
-            prediction = self.dit(
+            result = self.dit(
                 img=image_tokens[0].unsqueeze(0),
                 context=contexts[0].unsqueeze(0),
                 t=timesteps,
                 pos=torch.cat((text_positions, positions[0])).unsqueeze(0),
                 mask=mask,
                 ref_token_count=reference_lengths[0],
-            )[0]
-            return [prediction[:target_lengths[0]]]
+                alternate_t=alternate_timesteps,
+                alternate_target_mask=(
+                    alternate_target_masks[0].unsqueeze(0)
+                    if alternate_target_masks is not None
+                    else None
+                ),
+                representation_layer=representation_layer,
+                return_velocity=return_velocity,
+            )
+            if representation_layer is None:
+                return [result[0, :target_lengths[0]]]
+            prediction, representation = result
+            predictions = (
+                [prediction[0, :target_lengths[0]]]
+                if prediction is not None
+                else None
+            )
+            representations = [representation[0, :target_lengths[0]]]
+            if project_representation:
+                if self.representation_projector is None:
+                    raise RuntimeError("no representation projector is configured")
+                representations = [
+                    self.representation_projector(value)
+                    for value in representations
+                ]
+            return predictions, representations
 
-        return self.dit.forward_varlen(
+        result = self.dit.forward_varlen(
             image_tokens=image_tokens,
             context=contexts,
             t=timesteps,
             image_positions=positions,
             ref_token_counts=reference_lengths,
+            alternate_t=alternate_timesteps,
+            alternate_target_masks=alternate_target_masks,
+            representation_layer=representation_layer,
+            return_velocity=return_velocity,
         )
+        if representation_layer is None:
+            return result
+        predictions, representations = result
+        if project_representation:
+            if self.representation_projector is None:
+                raise RuntimeError("no representation projector is configured")
+            representations = [
+                self.representation_projector(value)
+                for value in representations
+            ]
+        return predictions, representations
 
 
 def target_velocity_tokens(clean: torch.Tensor, noise: torch.Tensor, patch: int):

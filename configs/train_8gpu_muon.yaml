@@ -34,6 +34,9 @@ lora:
   rank: 64
   alpha: 64
   dropout: 0.0
+  # gaussian preserves the previous behavior; nora_init normalizes every
+  # down-projection column once before training, then trains as standard LoRA.
+  initialization: nora_init  # gaussian or nora_init
   target_modules: all-linear
 
 train:
@@ -41,6 +44,23 @@ train:
   steps: 2000
   gradient_accumulation: 4
   gradient_checkpointing: true
+  # EMA accumulates trainable DiT/LoRA tensors in FP32 on the accelerator.
+  # During the first N optimizer steps the effective decay is 0 (exact copy).
+  ema:
+    enabled: true
+    decay: 0.9999
+    warmup_steps: 100
+    update_every: 1
+    device: accelerator
+  # Opt-in Self-Flow. Set enabled=true and loss.weights.self_flow=0.8 to use
+  # the paper recipe; this adds one EMA-teacher forward per micro-batch.
+  self_flow:
+    enabled: false
+    mask_ratio: 0.25
+    student_layer_ratio: 0.3
+    teacher_layer_ratio: 0.7
+    projection: mlp  # mlp or identity
+    projection_hidden_dim: 1024
   vae_latent_strategy: mode
   branch_sampling_weights:
     edit: 0.75
@@ -58,6 +78,7 @@ train:
       fm: 1.0
       perceptual: 0.1
       pixel: 0.1
+      self_flow: 0.0
     pixel_type: mse
     huber_delta: 1.0
     charbonnier_epsilon: 0.001

@@ -173,13 +173,33 @@ train:
 重新归一化。三种分支共享下述同一组 loss 配置，不增加 branch-specific loss 权重，
 也不增加已排除的 edit/no-op delta consistency。
 
+## LoRA 初始化
+
+`lora.initialization` 支持原有 `gaussian` 和
+[NoRA-init](https://arxiv.org/abs/2608.31036) 两种模式：
+
+```yaml
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  initialization: nora_init  # gaussian | nora_init
+  target_modules: all-linear
+```
+
+`nora_init` 先沿 LoRA rank 维把每个 down-projection `A` 的列归一化为单位
+L2 范数，up-projection `B` 仍保持 PEFT 的全零初始化；该操作只执行一次。初始化
+完成后没有额外 forward 归一化，优化、checkpoint、合并和推理路径都与普通 LoRA
+相同。省略该字段时默认 `gaussian`，因此旧配置不会静默改变。论文建议将
+`alpha` 设为 `rank`；两份示例配置的 `64/64` 已符合这一设置。
+
 ## 可组合 FM、PFM 与 Pixel Loss
 
 PFM 路径参考 [Perceptual Flow Matching 论文](https://arxiv.org/abs/2607.03524)
 及其[官方实现](https://github.com/ZhaoChuyang/PFM)。
 
-`train.loss.weights` 中三个系数完全独立；设为 `0` 即禁用，因此可以自由组合纯 FM、
-纯 PFM、纯 pixel，或自行决定主项和辅助项：
+`train.loss.weights` 中四个系数完全独立；设为 `0` 即禁用，因此可以自由组合 FM、
+PFM、pixel 与下文的 Self-Flow 表征目标，或自行决定主项和辅助项：
 
 ```yaml
 train:
@@ -188,6 +208,7 @@ train:
       fm: 1.0
       perceptual: 0.1
       pixel: 0.1
+      self_flow: 0.0
     pixel_type: mse  # mse | l1 | huber | charbonnier
     huber_delta: 1.0
     charbonnier_epsilon: 0.001
@@ -217,6 +238,19 @@ train:
         min_input_size: 64
         max_input_size: 224
         weight: 1.0
+  ema:
+    enabled: true
+    decay: 0.9999
+    warmup_steps: 100
+    update_every: 1
+    device: accelerator
+  self_flow:
+    enabled: false
+    mask_ratio: 0.25
+    student_layer_ratio: 0.3
+    teacher_layer_ratio: 0.7
+    projection: mlp  # mlp | identity
+    projection_hidden_dim: 1024
 ```
 
 所有启用项先使用同一个模型预测。训练器把 ragged velocity tokens 还原为 latent
@@ -232,6 +266,8 @@ x0_prediction = noisy_target - t * predicted_velocity
   `weight`，其绝对加权和再乘 `weights.perceptual`；内部权重不会自动归一化。
 - `pixel`：在 `[-1, 1]` RGB 空间比较同一张 decode 预测与监督图，支持 MSE、L1、
   Huber 和 Charbonnier。
+- `self_flow`：学生浅层 target-token 表征与 EMA 教师深层表征的 cosine distance；
+  不依赖外部视觉 backbone，也不经过 VAE decoder。
 
 按当前实现，监督端直接使用 VAE encode 之前的数据图像，不额外 decode clean
 latent：edit 与 instruction-dropout 使用原 target，noop 使用 primary source。预测端
@@ -307,6 +343,71 @@ tower 以保留对 prediction 的梯度，并释放不使用的 text tower。DIN
 `facebook/dinov3-vits16-pretrain-lvd1689m` 是 gated 权重，需要先接受其许可并缓存。
 当前启动脚本使用 Hugging Face 离线模式，因此缺失缓存时会直接报错。只需要 pixel
 loss 时可把 `perceptual` 设为 `0`，此时不会加载任何感知模型。
+
+## Self-Flow 与 EMA teacher
+
+训练器支持 [Self-Flow](https://arxiv.org/abs/2603.06507) 的 Dual-Timestep Scheduling
+和自监督表征对齐。要启用论文主目标，同时设置：
+
+```yaml
+train:
+  loss:
+    weights:
+      fm: 1.0
+      perceptual: 0.0
+      pixel: 0.0
+      self_flow: 0.8
+  self_flow:
+    enabled: true
+    mask_ratio: 0.25
+    student_layer_ratio: 0.3
+    teacher_layer_ratio: 0.7
+    projection: mlp
+    projection_hidden_dim: 1024
+  ema:
+    enabled: true
+    decay: 0.9999
+    warmup_steps: 100
+    update_every: 1
+    device: accelerator
+```
+
+每个样本独立采样 `t,s`，并以 `mask_ratio` 在 target patch token 上采样 mask；mask
+位置使用 `s`，其余位置使用 `t`。FM 的 noising、token timestep conditioning、
+timestep loss weight，以及由 velocity 还原 `x0_prediction` 时使用的都是同一张
+per-token timestep map。reference token 保持现有编辑架构的 `t=0`。
+
+EMA teacher 使用相同的 clean latent 与 noise，但所有 target token 都使用
+`min(t,s)`。教师处于 `eval` 且整个前向包在 `torch.no_grad()` 中，只运行到配置的
+teacher layer，不构建反向图；学生从较浅层取 target hidden states，经投影头后与
+教师 hidden states 计算逐 token cosine distance。Krea 的 28 层配置按论文
+`0.3D/0.7D` 解析为第 8/20 层，也可用 `student_layer` / `teacher_layer` 显式覆盖。
+
+论文明确使用 MLP projection head，但没有发布 head 的精确结构。这里的 `mlp` 是
+Krea 适配的 `6144 -> projection_hidden_dim -> 6144` 两层 SiLU MLP，只属于学生训练
+路径，不写入推理 LoRA；`identity` 可用于无投影消融。只设置
+`self_flow.enabled: true` 而保持 `weights.self_flow: 0`，则仅启用论文也报告过的
+Dual-Timestep Scheduling 消融，不创建投影头或教师前向。
+
+`train.ema.enabled: true` 对可训练的 DiT 参数（当前即 LoRA A/B）维护 FP32 EMA，
+不复制冻结基座，也不把学生专用投影头纳入 EMA。Self-Flow 开启时，每个 rank 都在
+自己的 accelerator 上维护 EMA；教师前向会把 FP32 shadow 转为 BF16 后以 stateless
+方式调用同一 DiT，不会原地覆盖仍参与学生反向的在线参数。Self-Flow 因而要求
+`device: accelerator` 和 `model.dtype: bf16`。仅用于预览/导出的普通 EMA 模式仍
+允许 `cpu`，并只需由主进程维护一份。
+
+`warmup_steps: N` 是针对从随机 LoRA 开始训练的适配：前 N 个实际 optimizer step
+仍每步更新 teacher，但有效衰减系数固定为 `0`，即 teacher 精确复制最新在线 LoRA；
+第 N+1 步起才使用配置的 `decay`。之后 `update_every` 控制更新间隔。所有计数都按
+`global_step`，不是 gradient-accumulation micro-step。论文使用 `decay=0.9999`、
+图像 `mask_ratio=0.25`、`self_flow=0.8` 和 `0.3D/0.7D`，但没有使用这里额外提供的
+EMA warmup。
+
+启用 EMA 后，定期预览自动临时切换到 EMA LoRA，完成后恢复在线参数。checkpoint
+同时保留在线和 EMA adapter，并用 `ema_state.pt` 保存 FP32 shadow 与计数；恢复旧
+checkpoint 如果找不到 EMA state，会从已恢复的在线 LoRA 重新初始化。Self-Flow
+会增加一次截断到 teacher layer 的前向，并让每个 rank 常驻一份 FP32 LoRA shadow，
+需要相应预留显存。
 
 ## DIT 与 TE 独立量化
 
@@ -508,6 +609,12 @@ logging:
 `train/lr_adam`（存在辅助 Adam 组时）。micro-step 不会产生重复记录。将
 `logging.backend` 改为 `null` 可以关闭在线记录。
 
+训练日志中的 `train/loss` 是应用外层系数后的总损失；启用的分量还会分别记录为
+`train/loss_fm`、`train/loss_perceptual`、`train/loss_pixel` 和
+`train/loss_self_flow`。分量值是在外层
+`train.loss.weights` 系数应用前的原始值，其中 perceptual 分量已经包含各视觉
+backbone 自己的内部权重。终端日志会同步输出所有实际启用的 `{name}_loss` 项目。
+
 ## 训练中采样
 
 采样走完整的编辑推理路径：参考图同时经过 Qwen3-VL 与 VAE，参考 latent 在
@@ -562,6 +669,9 @@ grid 以有损 WebP `quality=80` 保存，避免长期训练的本地与 W&B 图
 output/krea2edit/checkpoint-00000250/
 ├─ adapter/                         # PEFT 格式，用于继续训练或 PEFT 加载
 ├─ krea2edit_comfyui.safetensors    # ComfyUI 可直接加载的 LoRA
+├─ adapter_ema/                     # EMA 的 PEFT LoRA
+├─ krea2edit_comfyui_ema.safetensors # ComfyUI 可直接加载的 EMA LoRA
+├─ ema_state.pt                     # EMA shadow 与更新计数，用于继续训练
 ├─ Accelerate/DeepSpeed model、optimizer 与 scheduler state
 └─ random_states_*.pkl
 ```
@@ -572,6 +682,8 @@ PEFT 的 `base_model.model.` 前缀转换成 ComfyUI 的 `diffusion_model.`，�
 LoRA 模块写入 `alpha`，因此
 `lora.alpha != lora.rank` 时 ComfyUI 的强度也与训练一致。不要把
 `adapter/adapter_model.safetensors` 直接交给 ComfyUI；它保留的是 PEFT 命名。
+启用 EMA 时，通常优先评估 `krea2edit_comfyui_ema.safetensors`；非 EMA 文件仍是
+当前 optimizer step 的在线 LoRA，方便直接比较两者。
 
 已有 PEFT adapter 可以直接转换，不会启动训练：
 
@@ -595,6 +707,7 @@ train:
 
 - 独立入口：[train.py](train.py)
 - ragged manifest 数据层：[krea2edit/data.py](krea2edit/data.py)
+- 仅追踪可训练参数的 EMA：[krea2edit/ema.py](krea2edit/ema.py)
 - 权重、VLM/VAE、Quanto、PEFT 与 packed model：[krea2edit/modeling.py](krea2edit/modeling.py)
 - reference-conditioned flow 采样与 WebP 预览：[krea2edit/sampling.py](krea2edit/sampling.py)
 - 实验性双向 SVDQuant、转置 checkpoint 与 autograd：[krea2edit/svdquant.py](krea2edit/svdquant.py)

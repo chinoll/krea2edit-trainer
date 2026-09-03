@@ -10,11 +10,13 @@ import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import set_seed
 from diffusers.optimization import get_scheduler
+from torch.func import functional_call
 from torch.utils.data import DataLoader
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from tqdm.auto import tqdm
 
 from krea2edit.data import EditManifestDataset, ragged_collate
+from krea2edit.ema import TrainableParameterEMA
 from krea2edit.modeling import (
     ConditioningModels,
     RaggedEditModel,
@@ -42,7 +44,7 @@ from krea2edit.timesteps import sample_timesteps
 DEEPSPEED_MUON_NAMES = {"deepspeed_muon", "muon"}
 TRAINING_BRANCHES = ("edit", "instruction_dropout", "noop")
 VAE_LATENT_STRATEGIES = {"mode", "independent_sample"}
-LOSS_NAMES = ("fm", "perceptual", "pixel")
+LOSS_NAMES = ("fm", "perceptual", "pixel", "self_flow")
 PIXEL_LOSS_TYPES = {"mse", "l1", "huber", "charbonnier"}
 DEFAULT_PERCEPTUAL_BACKBONES = [
     {
@@ -61,6 +63,149 @@ DEFAULT_PERCEPTUAL_BACKBONES = [
         "weight": 1.0,
     },
 ]
+
+
+def ema_recipe(config: dict):
+    raw_ema = config.get("ema", {})
+    if not isinstance(raw_ema, dict):
+        raise TypeError("train.ema must be a mapping")
+    allowed_entries = {
+        "enabled",
+        "decay",
+        "warmup_steps",
+        "update_every",
+        "device",
+    }
+    unknown_entries = set(raw_ema) - allowed_entries
+    if unknown_entries:
+        raise ValueError(
+            "unknown train.ema entries: " + ", ".join(sorted(unknown_entries))
+        )
+
+    enabled = raw_ema.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise TypeError("train.ema.enabled must be a boolean")
+    decay = float(raw_ema.get("decay", 0.9999))
+    if not math.isfinite(decay) or not 0.0 <= decay < 1.0:
+        raise ValueError("train.ema.decay must be finite and in [0, 1)")
+    warmup_steps = raw_ema.get("warmup_steps", 0)
+    update_every = raw_ema.get("update_every", 1)
+    if (
+        isinstance(warmup_steps, bool)
+        or not isinstance(warmup_steps, int)
+        or warmup_steps < 0
+    ):
+        raise ValueError("train.ema.warmup_steps must be an integer >= 0")
+    if (
+        isinstance(update_every, bool)
+        or not isinstance(update_every, int)
+        or update_every <= 0
+    ):
+        raise ValueError("train.ema.update_every must be an integer > 0")
+    device = str(raw_ema.get("device", "accelerator")).lower()
+    if device not in {"cpu", "accelerator"}:
+        raise ValueError("train.ema.device must be cpu or accelerator")
+    return {
+        "enabled": enabled,
+        "decay": decay,
+        "warmup_steps": warmup_steps,
+        "update_every": update_every,
+        "device": device,
+    }
+
+
+def self_flow_recipe(config: dict):
+    raw = config.get("self_flow", {})
+    if not isinstance(raw, dict):
+        raise TypeError("train.self_flow must be a mapping")
+    allowed_entries = {
+        "enabled",
+        "mask_ratio",
+        "student_layer_ratio",
+        "teacher_layer_ratio",
+        "student_layer",
+        "teacher_layer",
+        "projection",
+        "projection_hidden_dim",
+    }
+    unknown_entries = set(raw) - allowed_entries
+    if unknown_entries:
+        raise ValueError(
+            "unknown train.self_flow entries: "
+            + ", ".join(sorted(unknown_entries))
+        )
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise TypeError("train.self_flow.enabled must be a boolean")
+    mask_ratio = float(raw.get("mask_ratio", 0.25))
+    if not math.isfinite(mask_ratio) or not 0.0 <= mask_ratio <= 0.5:
+        raise ValueError("train.self_flow.mask_ratio must be finite and in [0, 0.5]")
+
+    student_layer_ratio = float(raw.get("student_layer_ratio", 0.3))
+    teacher_layer_ratio = float(raw.get("teacher_layer_ratio", 0.7))
+    for name, value in (
+        ("student_layer_ratio", student_layer_ratio),
+        ("teacher_layer_ratio", teacher_layer_ratio),
+    ):
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            raise ValueError(f"train.self_flow.{name} must be finite and in (0, 1]")
+
+    explicit_layers = {}
+    for name in ("student_layer", "teacher_layer"):
+        value = raw.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise ValueError(f"train.self_flow.{name} must be an integer > 0")
+        explicit_layers[name] = value
+
+    projection = str(raw.get("projection", "mlp")).lower()
+    if projection not in {"mlp", "identity"}:
+        raise ValueError("train.self_flow.projection must be mlp or identity")
+    projection_hidden_dim = raw.get("projection_hidden_dim", 1024)
+    if (
+        isinstance(projection_hidden_dim, bool)
+        or not isinstance(projection_hidden_dim, int)
+        or projection_hidden_dim <= 0
+    ):
+        raise ValueError(
+            "train.self_flow.projection_hidden_dim must be an integer > 0"
+        )
+
+    return {
+        "enabled": enabled,
+        "mask_ratio": mask_ratio,
+        "student_layer_ratio": student_layer_ratio,
+        "teacher_layer_ratio": teacher_layer_ratio,
+        "student_layer": explicit_layers["student_layer"],
+        "teacher_layer": explicit_layers["teacher_layer"],
+        "projection": projection,
+        "projection_hidden_dim": projection_hidden_dim,
+    }
+
+
+def resolve_self_flow_layers(config: dict, depth: int):
+    def resolve(name: str, ratio_name: str):
+        explicit = config[name]
+        if explicit is not None:
+            layer = explicit
+        else:
+            layer = round(config[ratio_name] * depth)
+        if not 1 <= layer <= depth:
+            raise ValueError(
+                f"train.self_flow.{name} resolves to {layer}, but model depth is {depth}"
+            )
+        return layer
+
+    student = resolve("student_layer", "student_layer_ratio")
+    teacher = resolve("teacher_layer", "teacher_layer_ratio")
+    if student >= teacher:
+        raise ValueError(
+            "Self-Flow requires student_layer < teacher_layer; "
+            f"resolved to {student} and {teacher}"
+        )
+    return student, teacher
 
 
 def training_recipe(config: dict):
@@ -146,7 +291,8 @@ def loss_recipe(config: dict):
         )
 
     raw_weights = raw_loss.get(
-        "weights", {"fm": 1.0, "perceptual": 0.0, "pixel": 0.0}
+        "weights",
+        {"fm": 1.0, "perceptual": 0.0, "pixel": 0.0, "self_flow": 0.0},
     )
     if not isinstance(raw_weights, dict):
         raise TypeError("train.loss.weights must be a mapping")
@@ -234,14 +380,14 @@ def decode_flow_endpoints(
     predictions: list[torch.Tensor],
     noisy_targets: list[torch.Tensor],
     target_images: list[torch.Tensor],
-    timesteps: torch.Tensor,
+    timestep_fields: list[torch.Tensor],
     patch: int,
     use_gradient_checkpointing: bool,
 ):
     predicted_pixels = []
     target_pixels = []
-    for prediction, noisy, target_image, timestep in zip(
-        predictions, noisy_targets, target_images, timesteps
+    for prediction, noisy, target_image, timestep_field in zip(
+        predictions, noisy_targets, target_images, timestep_fields
     ):
         velocity = velocity_tokens_to_latent(
             prediction,
@@ -249,7 +395,9 @@ def decode_flow_endpoints(
             noisy.shape[-1],
             patch,
         )
-        predicted_clean = noisy.float() - timestep.float() * velocity.float()
+        predicted_clean = (
+            noisy.float() - timestep_field.float() * velocity.float()
+        )
         if use_gradient_checkpointing:
             decoded_prediction = activation_checkpoint(
                 conditioning.decode_latent_to_pixels,
@@ -275,6 +423,129 @@ def decode_flow_endpoints(
         predicted_pixels.append(decoded_prediction)
         target_pixels.append(decoded_target)
     return predicted_pixels, target_pixels
+
+
+def dual_timestep_fields(
+    clean_targets: list[torch.Tensor],
+    timesteps: torch.Tensor,
+    alternate_timesteps: torch.Tensor,
+    alternate_target_masks: list[torch.Tensor],
+    patch: int,
+):
+    fields = []
+    for clean, timestep, alternate_timestep, alternate_mask in zip(
+        clean_targets,
+        timesteps,
+        alternate_timesteps,
+        alternate_target_masks,
+    ):
+        height, width = clean.shape[-2:]
+        grid_height, grid_width = height // patch, width // patch
+        if alternate_mask.shape != (grid_height * grid_width,):
+            raise ValueError("dual-timestep mask does not match target token count")
+        token_times = torch.where(
+            alternate_mask,
+            alternate_timestep,
+            timestep,
+        ).reshape(grid_height, grid_width)
+        fields.append(
+            token_times.repeat_interleave(patch, dim=0)
+            .repeat_interleave(patch, dim=1)
+            .unsqueeze(0)
+        )
+    return fields
+
+
+def dual_timestep_flow_loss(
+    predictions: list[torch.Tensor],
+    clean_targets: list[torch.Tensor],
+    noises: list[torch.Tensor],
+    timestep_loss_weights: torch.Tensor,
+    alternate_timestep_loss_weights: torch.Tensor,
+    alternate_target_masks: list[torch.Tensor],
+    patch: int,
+):
+    sample_losses = []
+    for (
+        prediction,
+        clean,
+        noise,
+        weight,
+        alternate_weight,
+        alternate_mask,
+    ) in zip(
+        predictions,
+        clean_targets,
+        noises,
+        timestep_loss_weights,
+        alternate_timestep_loss_weights,
+        alternate_target_masks,
+    ):
+        target = target_velocity_tokens(clean, noise, patch).float()
+        token_errors = (prediction.float() - target).square().mean(dim=-1)
+        token_weights = torch.where(
+            alternate_mask,
+            alternate_weight,
+            weight,
+        ).float()
+        sample_losses.append((token_errors * token_weights).mean())
+    return torch.stack(sample_losses).mean()
+
+
+def self_flow_representation_loss(
+    student_features: list[torch.Tensor],
+    teacher_features: list[torch.Tensor],
+):
+    if len(student_features) != len(teacher_features):
+        raise RuntimeError("Self-Flow student/teacher batch sizes differ")
+    losses = []
+    for student, teacher in zip(student_features, teacher_features):
+        if student.shape != teacher.shape:
+            raise RuntimeError(
+                "Self-Flow student/teacher feature shapes differ: "
+                f"{tuple(student.shape)} vs {tuple(teacher.shape)}"
+            )
+        losses.append(
+            1.0
+            - F.cosine_similarity(
+                student.float(), teacher.float(), dim=-1
+            ).mean()
+        )
+    return torch.stack(losses).mean()
+
+
+def ema_teacher_features(
+    model,
+    ema,
+    noisy_targets: list[torch.Tensor],
+    reference_latents: list[list[torch.Tensor]],
+    contexts: list[torch.Tensor],
+    timesteps: torch.Tensor,
+    representation_layer: int,
+):
+    """Run the stateless EMA teacher in eval/no-grad mode and return raw features."""
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            _, features = functional_call(
+                model,
+                ema.functional_parameters(model, dtype=torch.bfloat16),
+                (),
+                {
+                    "noisy_targets": noisy_targets,
+                    "references": reference_latents,
+                    "contexts": contexts,
+                    "timesteps": timesteps,
+                    "representation_layer": representation_layer,
+                    "project_representation": False,
+                    "return_velocity": False,
+                },
+                strict=False,
+            )
+    finally:
+        model.train(was_training)
+    return features
 
 
 def parse_args():
@@ -387,19 +658,31 @@ def verify_deepspeed_muon_optimizer(optimizer):
     )
 
 
-def save_checkpoint(accelerator, model, output_dir: Path, step: int):
+def save_checkpoint(accelerator, model, ema, output_dir: Path, step: int):
     checkpoint = output_dir / f"checkpoint-{step:08d}"
     accelerator.save_state(checkpoint)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
         adapter_dir = checkpoint / "adapter"
-        accelerator.unwrap_model(model).dit.save_pretrained(
+        unwrapped_model.dit.save_pretrained(
             adapter_dir, safe_serialization=True
         )
         export_comfyui_lora(
             adapter_dir / "adapter_model.safetensors",
             checkpoint / "krea2edit_comfyui.safetensors",
         )
+        if ema is not None:
+            ema.save(checkpoint / "ema_state.pt")
+            with ema.average_parameters(unwrapped_model):
+                ema_adapter_dir = checkpoint / "adapter_ema"
+                unwrapped_model.dit.save_pretrained(
+                    ema_adapter_dir, safe_serialization=True
+                )
+                export_comfyui_lora(
+                    ema_adapter_dir / "adapter_model.safetensors",
+                    checkpoint / "krea2edit_comfyui_ema.safetensors",
+                )
     accelerator.wait_for_everyone()
 
 
@@ -412,17 +695,30 @@ def run_previews(
     output_dir: Path,
     step: int,
     logging_backend,
+    ema,
 ):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        result = generate_previews(
-            accelerator.unwrap_model(model),
-            conditioning,
-            dataset,
-            config,
-            output_dir,
-            step,
-        )
+        unwrapped_model = accelerator.unwrap_model(model)
+        if ema is None:
+            result = generate_previews(
+                unwrapped_model,
+                conditioning,
+                dataset,
+                config,
+                output_dir,
+                step,
+            )
+        else:
+            with ema.average_parameters(unwrapped_model):
+                result = generate_previews(
+                    unwrapped_model,
+                    conditioning,
+                    dataset,
+                    config,
+                    output_dir,
+                    step,
+                )
         accelerator.print(
             f"step={step} sample_grid={result['rows']}x{result['columns']} "
             f"samples={len(result['sample_ids'])} path={result['path']}"
@@ -471,7 +767,25 @@ def main():
         train_config
     )
     configured_loss = loss_recipe(train_config)
+    configured_ema = ema_recipe(train_config)
+    configured_self_flow = self_flow_recipe(train_config)
     configured_loss_weights = configured_loss["weights"]
+    self_flow_enabled = configured_self_flow["enabled"]
+    self_flow_teacher_enabled = (
+        self_flow_enabled and configured_loss_weights["self_flow"] > 0.0
+    )
+    if configured_loss_weights["self_flow"] > 0.0 and not self_flow_enabled:
+        raise ValueError(
+            "train.loss.weights.self_flow > 0 requires train.self_flow.enabled: true"
+        )
+    if self_flow_teacher_enabled and not configured_ema["enabled"]:
+        raise ValueError("Self-Flow representation loss requires train.ema.enabled: true")
+    if self_flow_teacher_enabled and configured_ema["device"] != "accelerator":
+        raise ValueError(
+            "Self-Flow teacher requires train.ema.device: accelerator"
+        )
+    if self_flow_teacher_enabled and config["model"]["dtype"] != "bf16":
+        raise ValueError("Self-Flow EMA teacher requires model.dtype: bf16")
     decoded_loss_enabled = (
         configured_loss_weights["perceptual"] > 0.0
         or configured_loss_weights["pixel"] > 0.0
@@ -561,7 +875,21 @@ def main():
         dit = add_lora(dit, config["lora"])
     if train_config["gradient_checkpointing"]:
         dit.base_model.model.enable_gradient_checkpointing()
-    model = RaggedEditModel(dit)
+    model = RaggedEditModel(
+        dit,
+        representation_projection=(
+            configured_self_flow["projection"]
+            if self_flow_teacher_enabled
+            else "none"
+        ),
+        projection_hidden_dim=configured_self_flow["projection_hidden_dim"],
+    )
+    self_flow_student_layer = None
+    self_flow_teacher_layer = None
+    if self_flow_teacher_enabled:
+        self_flow_student_layer, self_flow_teacher_layer = resolve_self_flow_layers(
+            configured_self_flow, model.depth
+        )
 
     optimizer = make_optimizer(model, train_config)
     optimizer_group_names = [group.get("name") for group in optimizer.param_groups]
@@ -586,6 +914,24 @@ def main():
         verify_deepspeed_muon_optimizer(optimizer) if use_deepspeed_muon else None
     )
     dataloader = accelerator.prepare_data_loader(dataloader, device_placement=False)
+
+    ema = None
+    if configured_ema["enabled"] and (
+        accelerator.is_main_process or self_flow_teacher_enabled
+    ):
+        ema_device = (
+            torch.device("cpu")
+            if configured_ema["device"] == "cpu"
+            else accelerator.device
+        )
+        ema = TrainableParameterEMA(
+            accelerator.unwrap_model(model),
+            decay=configured_ema["decay"],
+            warmup_steps=configured_ema["warmup_steps"],
+            update_every=configured_ema["update_every"],
+            device=ema_device,
+            include_prefixes=("dit.",),
+        )
 
     conditioning = ConditioningModels(config["model"], dtype, accelerator.device)
     accelerator.init_trackers(config["project_name"], config=config)
@@ -627,15 +973,55 @@ def main():
                 f"adam_trainable_elements={adam_trainable_elements} "
                 "reduce_scatter=false"
             )
+        if ema is not None:
+            accelerator.print(
+                f"ema_decay={ema.decay} ema_warmup_steps="
+                f"{ema.warmup_steps} ema_update_every={ema.update_every} "
+                f"ema_device={ema.device} ema_trainable_elements={ema.parameter_count}"
+            )
+        if self_flow_enabled:
+            self_flow_line = (
+                f"self_flow_mask_ratio={configured_self_flow['mask_ratio']}"
+            )
+            if self_flow_teacher_enabled:
+                self_flow_line += (
+                    f" self_flow_student_layer={self_flow_student_layer}"
+                    f" self_flow_teacher_layer={self_flow_teacher_layer}"
+                    f" self_flow_projection={configured_self_flow['projection']}"
+                )
+            accelerator.print(self_flow_line)
 
     global_step = 0
     resume_from = train_config.get("resume_from")
     if resume_from:
         accelerator.load_state(resume_from)
         global_step = int(Path(resume_from).name.rsplit("-", 1)[-1])
+        if ema is not None:
+            ema_path = Path(resume_from) / "ema_state.pt"
+            if ema_path.is_file():
+                ema.load(ema_path, accelerator.unwrap_model(model))
+            else:
+                ema.reset(accelerator.unwrap_model(model))
+                accelerator.print(
+                    "EMA state is absent from the resumed checkpoint; initialized "
+                    "EMA from the resumed online LoRA weights."
+                )
 
     model.train()
     accumulated_loss = torch.zeros((), device=accelerator.device)
+    active_loss_names = tuple(
+        name
+        for name in LOSS_NAMES
+        if configured_loss_weights[name] > 0.0
+    )
+    active_loss_indices = {
+        name: index for index, name in enumerate(active_loss_names)
+    }
+    accumulated_component_losses = torch.zeros(
+        len(active_loss_names),
+        device=accelerator.device,
+        dtype=torch.float32,
+    )
     accumulated_micro_steps = 0
     while global_step < int(train_config["steps"]):
         data_progress = tqdm(
@@ -710,32 +1096,124 @@ def main():
                     train_config["timestep_sampling"], len(batch), token_counts, accelerator.device
                 )
                 timesteps = timesteps.to(dtype)
+                alternate_timesteps = None
+                alternate_timestep_loss_weights = None
+                alternate_target_masks = None
+                if self_flow_enabled:
+                    (
+                        alternate_timesteps,
+                        alternate_timestep_loss_weights,
+                    ) = sample_timesteps(
+                        train_config["timestep_sampling"],
+                        len(batch),
+                        token_counts,
+                        accelerator.device,
+                    )
+                    alternate_timesteps = alternate_timesteps.to(dtype)
+                    alternate_target_masks = [
+                        torch.rand(count, device=accelerator.device)
+                        < configured_self_flow["mask_ratio"]
+                        for count in token_counts
+                    ]
                 noises = [torch.randn_like(latent) for latent in clean_targets]
+                if self_flow_enabled:
+                    timestep_fields = dual_timestep_fields(
+                        clean_targets,
+                        timesteps,
+                        alternate_timesteps,
+                        alternate_target_masks,
+                        patch,
+                    )
+                else:
+                    timestep_fields = list(timesteps)
                 noisy_targets = [
-                    (1.0 - timestep) * clean + timestep * noise
-                    for clean, noise, timestep in zip(clean_targets, noises, timesteps)
+                    (1.0 - timestep_field) * clean + timestep_field * noise
+                    for clean, noise, timestep_field in zip(
+                        clean_targets, noises, timestep_fields
+                    )
                 ]
-                predictions = model(
-                    noisy_targets,
-                    reference_latents,
-                    contexts,
-                    timesteps,
-                )
-                loss = predictions[0].new_zeros((), dtype=torch.float32)
+                if self_flow_teacher_enabled:
+                    predictions, student_features = model(
+                        noisy_targets,
+                        reference_latents,
+                        contexts,
+                        timesteps,
+                        alternate_timesteps=alternate_timesteps,
+                        alternate_target_masks=alternate_target_masks,
+                        representation_layer=self_flow_student_layer,
+                        project_representation=True,
+                        return_velocity=True,
+                    )
+                else:
+                    predictions = model(
+                        noisy_targets,
+                        reference_latents,
+                        contexts,
+                        timesteps,
+                        alternate_timesteps=alternate_timesteps,
+                        alternate_target_masks=alternate_target_masks,
+                    )
+                    student_features = None
+                # Keep the final velocity path attached even for a Self-Flow-only
+                # ablation, so distributed wrappers do not see later DiT layers as
+                # unused parameters.
+                loss = predictions[0].float().sum() * 0.0
+                component_losses = {}
                 if configured_loss_weights["fm"] > 0.0:
-                    fm_losses = [
-                        F.mse_loss(
-                            prediction.float(),
-                            target_velocity_tokens(clean, noise, patch).float(),
+                    if self_flow_enabled:
+                        fm_loss = dual_timestep_flow_loss(
+                            predictions,
+                            clean_targets,
+                            noises,
+                            timestep_loss_weights,
+                            alternate_timestep_loss_weights,
+                            alternate_target_masks,
+                            patch,
                         )
-                        for prediction, clean, noise in zip(
-                            predictions, clean_targets, noises
+                    else:
+                        fm_losses = [
+                            F.mse_loss(
+                                prediction.float(),
+                                target_velocity_tokens(clean, noise, patch).float(),
+                            )
+                            for prediction, clean, noise in zip(
+                                predictions, clean_targets, noises
+                            )
+                        ]
+                        fm_loss = (
+                            torch.stack(fm_losses) * timestep_loss_weights
+                        ).mean()
+                    component_losses["fm"] = fm_loss
+                    loss = loss + configured_loss_weights["fm"] * fm_loss
+
+                if self_flow_teacher_enabled:
+                    teacher_timesteps = torch.minimum(
+                        timesteps, alternate_timesteps
+                    )
+                    teacher_noisy_targets = [
+                        (1.0 - timestep) * clean + timestep * noise
+                        for clean, noise, timestep in zip(
+                            clean_targets, noises, teacher_timesteps
                         )
                     ]
-                    fm_loss = (
-                        torch.stack(fm_losses) * timestep_loss_weights
-                    ).mean()
-                    loss = loss + configured_loss_weights["fm"] * fm_loss
+                    teacher_features = ema_teacher_features(
+                        accelerator.unwrap_model(model),
+                        ema,
+                        teacher_noisy_targets,
+                        reference_latents,
+                        contexts,
+                        teacher_timesteps,
+                        self_flow_teacher_layer,
+                    )
+                    self_flow_value = self_flow_representation_loss(
+                        student_features, teacher_features
+                    )
+                    component_losses["self_flow"] = self_flow_value
+                    loss = (
+                        loss
+                        + configured_loss_weights["self_flow"]
+                        * self_flow_value
+                    )
 
                 if decoded_loss_enabled:
                     decoded_predictions, pixel_targets = decode_flow_endpoints(
@@ -743,7 +1221,7 @@ def main():
                         predictions=predictions,
                         noisy_targets=noisy_targets,
                         target_images=loss_target_images,
-                        timesteps=timesteps,
+                        timestep_fields=timestep_fields,
                         patch=patch,
                         use_gradient_checkpointing=configured_loss[
                             "gradient_checkpointing"
@@ -762,20 +1240,28 @@ def main():
                                 decoded_predictions, pixel_targets
                             )
                         ]
-                        loss = loss + configured_loss_weights["pixel"] * (
-                            torch.stack(pixel_losses).mean()
+                        pixel_value = torch.stack(pixel_losses).mean()
+                        component_losses["pixel"] = pixel_value
+                        loss = (
+                            loss
+                            + configured_loss_weights["pixel"] * pixel_value
                         )
                     if configured_loss_weights["perceptual"] > 0.0:
                         perceptual_value = perceptual_criterion(
                             decoded_predictions,
                             pixel_targets,
                         )
+                        component_losses["perceptual"] = perceptual_value
                         loss = (
                             loss
                             + configured_loss_weights["perceptual"]
                             * perceptual_value
                         )
                 accumulated_loss += loss.detach()
+                for name, component_loss in component_losses.items():
+                    accumulated_component_losses[
+                        active_loss_indices[name]
+                    ] += component_loss.detach()
                 accumulated_micro_steps += 1
 
                 accelerator.backward(loss)
@@ -796,10 +1282,21 @@ def main():
 
             if accelerator.sync_gradients:
                 global_step += 1
+                if ema is not None and not accelerator.optimizer_step_was_skipped:
+                    ema.update(accelerator.unwrap_model(model), global_step)
                 mean_loss = accelerator.reduce(
                     accumulated_loss / accumulated_micro_steps, reduction="mean"
                 ).item()
+                mean_component_values = accelerator.reduce(
+                    accumulated_component_losses / accumulated_micro_steps,
+                    reduction="mean",
+                )
+                mean_component_losses = {
+                    name: mean_component_values[index].item()
+                    for index, name in enumerate(active_loss_names)
+                }
                 accumulated_loss.zero_()
+                accumulated_component_losses.zero_()
                 accumulated_micro_steps = 0
                 learning_rates = scheduler.get_last_lr()
                 metrics = {
@@ -807,6 +1304,12 @@ def main():
                     "train/grad_norm": float(grad_norm),
                     "train/lr": learning_rates[0],
                 }
+                metrics.update(
+                    {
+                        f"train/loss_{name}": value
+                        for name, value in mean_component_losses.items()
+                    }
+                )
                 if muon_update_norm is not None:
                     metrics["train/muon_update_norm_pre_clip"] = float(muon_update_norm)
                 if use_deepspeed_muon:
@@ -823,11 +1326,18 @@ def main():
                         f"step={global_step} loss={mean_loss:.6f} "
                         f"grad_norm={float(grad_norm):.6f}"
                     )
+                    for name in active_loss_names:
+                        log_line += (
+                            f" {name}_loss="
+                            f"{mean_component_losses[name]:.6f}"
+                        )
                     if muon_update_norm is not None:
                         log_line += f" muon_update_norm_pre_clip={float(muon_update_norm):.6f}"
                     accelerator.print(log_line)
                 if global_step % int(train_config["save_every"]) == 0:
-                    save_checkpoint(accelerator, model, output_dir, global_step)
+                    save_checkpoint(
+                        accelerator, model, ema, output_dir, global_step
+                    )
                 if (
                     sampling_enabled
                     and global_step % int(sample_config["every"]) == 0
@@ -841,13 +1351,14 @@ def main():
                         output_dir,
                         global_step,
                         config["logging"].get("backend"),
+                        ema,
                     )
                 if global_step >= int(train_config["steps"]):
                     break
         data_progress.close()
 
     if global_step % int(train_config["save_every"]) != 0:
-        save_checkpoint(accelerator, model, output_dir, global_step)
+        save_checkpoint(accelerator, model, ema, output_dir, global_step)
     accelerator.end_training()
 
 

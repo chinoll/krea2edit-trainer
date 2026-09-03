@@ -360,13 +360,39 @@ class LastLayer(torch.nn.Module):
         self.linear = torch.nn.Linear(features, patch * patch * channels, bias=True)
         self.modulation = SimpleModulation(features)
 
-    def forward(self, x: Tensor, tvec: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        tvec: Tensor,
+        alternate_tvec: Tensor | None = None,
+        alternate_mask: Tensor | None = None,
+    ) -> Tensor:
         scale, shift = self.modulation(tvec)
-        x = (1 + scale) * self.norm(x) + shift
+        normalized = self.norm(x)
+        x = (1 + scale) * normalized + shift
+        if alternate_tvec is not None:
+            if alternate_mask is None or alternate_mask.shape != x.shape[:2]:
+                raise ValueError(
+                    "alternate final-layer mask must have shape (B, target_tokens)"
+                )
+            alternate_scale, alternate_shift = self.modulation(alternate_tvec)
+            batch_ids, token_ids = torch.where(alternate_mask)
+            x[batch_ids, token_ids] = (
+                (1 + alternate_scale[batch_ids, 0])
+                * normalized[batch_ids, token_ids]
+                + alternate_shift[batch_ids, 0]
+            )
         x = self.linear(x)
         return x
 
-    def forward_varlen(self, x: Tensor, tvec: Tensor, sample_ids: Tensor) -> Tensor:
+    def forward_varlen(
+        self,
+        x: Tensor,
+        tvec: Tensor,
+        sample_ids: Tensor,
+        alternate_tvec: Tensor | None = None,
+        alternate_mask: Tensor | None = None,
+    ) -> Tensor:
         """Final projection for selected packed tokens.
 
         ``tvec`` remains one vector per sample; only the target tokens are sent
@@ -374,7 +400,21 @@ class LastLayer(torch.nn.Module):
         """
         scale, shift = self.modulation(tvec)
         scale, shift = scale[:, 0, :], shift[:, 0, :]
-        x = (1 + scale[sample_ids]) * self.norm(x) + shift[sample_ids]
+        normalized = self.norm(x)
+        x = (1 + scale[sample_ids]) * normalized + shift[sample_ids]
+        if alternate_tvec is not None:
+            if alternate_mask is None or alternate_mask.shape != x.shape[:1]:
+                raise ValueError(
+                    "packed alternate final-layer mask must match target tokens"
+                )
+            alternate_scale, alternate_shift = self.modulation(alternate_tvec)
+            alternate_scale = alternate_scale[:, 0, :][sample_ids]
+            alternate_shift = alternate_shift[:, 0, :][sample_ids]
+            x = torch.where(
+                alternate_mask[:, None],
+                (1 + alternate_scale) * normalized + alternate_shift,
+                x,
+            )
         return self.linear(x)
 
 
@@ -464,93 +504,108 @@ class SingleStreamBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        vec: Tensor,
+        normal_vec: Tensor,
         freqs: Tensor,
         mask: Tensor | None = None,
+        clean_vec: Tensor | None = None,
         clean_token_range: tuple[int, int] | None = None,
+        alternate_vec: Tensor | None = None,
+        alternate_token_mask: Tensor | None = None,
     ) -> Tensor:
-        """Apply AdaLN-single modulation, optionally using ``t=0`` for one span.
+        """Apply normal, alternate target, and clean-reference modulation."""
+        normal = self.mod(normal_vec)
+        alternate = self.mod(alternate_vec) if alternate_vec is not None else None
+        clean = self.mod(clean_vec) if clean_vec is not None else None
 
-        ``vec`` contains the normal target-timestep modulation vector. When
-        ``clean_token_range`` is provided it is batch-concatenated with the
-        matching ``t=0`` vector: ``[target_t (B) ; clean_t (B)]``. Keeping this
-        as a 2B stack (rather than materializing B x sequence x 6D modulation values)
-        preserves the reference architecture's memory profile.  Attention remains
-        over the full sequence, so clean reference tokens can still interact with
-        noisy target tokens at every block.
-        """
+        if alternate is not None and (
+            alternate_token_mask is None
+            or alternate_token_mask.shape != x.shape[:2]
+        ):
+            raise ValueError("alternate token mask must have shape (B, sequence)")
         if clean_token_range is not None:
-            if vec.shape[0] != 2 * x.shape[0]:
-                raise ValueError(
-                    "clean_token_range requires [target_t ; clean_t] modulation vectors"
-                )
+            if clean is None:
+                raise ValueError("clean_token_range requires clean modulation vectors")
             start, end = clean_token_range
             if not (0 <= start < end <= x.shape[1]):
                 raise ValueError(
                     f"invalid clean token range [{start}, {end}) for sequence length {x.shape[1]}"
                 )
-            (
-                prescale,
-                preshift,
-                pregate,
-                postscale,
-                postshift,
-                postgate,
-            ) = self.mod(vec)
-            bs = x.shape[0]
-            (
-                clean_prescale,
-                clean_preshift,
-                clean_pregate,
-                clean_postscale,
-                clean_postshift,
-                clean_postgate,
-            ) = (
-                prescale[bs:],
-                preshift[bs:],
-                pregate[bs:],
-                postscale[bs:],
-                postshift[bs:],
-                postgate[bs:],
-            )
-            prescale, preshift, pregate, postscale, postshift, postgate = (
-                prescale[:bs],
-                preshift[:bs],
-                pregate[:bs],
-                postscale[:bs],
-                postshift[:bs],
-                postgate[:bs],
-            )
 
-            pre_norm = self.prenorm(x)
-            pre = (1 + prescale) * pre_norm + preshift
-            pre[:, start:end] = (
-                (1 + clean_prescale) * pre_norm[:, start:end] + clean_preshift
-            )
-            attn = self.attn(pre, freqs, mask)
-            attn[:, :start] *= pregate
-            attn[:, start:end] *= clean_pregate
-            attn[:, end:] *= pregate
-            x = x + attn
+        def affine(
+            normalized: Tensor,
+            normal_scale: Tensor,
+            normal_shift: Tensor,
+            alternate_scale: Tensor | None,
+            alternate_shift: Tensor | None,
+            clean_scale: Tensor | None,
+            clean_shift: Tensor | None,
+        ) -> Tensor:
+            result = (1 + normal_scale) * normalized + normal_shift
+            if alternate_scale is not None:
+                batch_ids, token_ids = torch.where(alternate_token_mask)
+                result[batch_ids, token_ids] = (
+                    (1 + alternate_scale[batch_ids, 0])
+                    * normalized[batch_ids, token_ids]
+                    + alternate_shift[batch_ids, 0]
+                )
+            if clean_scale is not None:
+                start, end = clean_token_range
+                result[:, start:end] = (
+                    (1 + clean_scale) * normalized[:, start:end] + clean_shift
+                )
+            return result
 
-            post_norm = self.postnorm(x)
-            post = (1 + postscale) * post_norm + postshift
-            post[:, start:end] = (
-                (1 + clean_postscale) * post_norm[:, start:end] + clean_postshift
-            )
-            mlp = self.mlp(post)
-            mlp[:, :start] *= postgate
-            mlp[:, start:end] *= clean_postgate
-            mlp[:, end:] *= postgate
-            return x + mlp
+        def gate(
+            update: Tensor,
+            normal_gate: Tensor,
+            alternate_gate: Tensor | None,
+            clean_gate: Tensor | None,
+        ) -> Tensor:
+            result = normal_gate * update
+            if alternate_gate is not None:
+                batch_ids, token_ids = torch.where(alternate_token_mask)
+                result[batch_ids, token_ids] = (
+                    alternate_gate[batch_ids, 0] * update[batch_ids, token_ids]
+                )
+            if clean_gate is not None:
+                start, end = clean_token_range
+                result[:, start:end] = clean_gate * update[:, start:end]
+            return result
 
-        prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        x = x + pregate * self.attn(
-            (1 + prescale) * self.prenorm(x) + preshift, freqs, mask
+        alternate_values = alternate or (None,) * 6
+        clean_values = clean or (None,) * 6
+        pre_norm = self.prenorm(x)
+        pre = affine(
+            pre_norm,
+            normal[0],
+            normal[1],
+            alternate_values[0],
+            alternate_values[1],
+            clean_values[0],
+            clean_values[1],
         )
-        x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
-
-        return x
+        x = x + gate(
+            self.attn(pre, freqs, mask),
+            normal[2],
+            alternate_values[2],
+            clean_values[2],
+        )
+        post_norm = self.postnorm(x)
+        post = affine(
+            post_norm,
+            normal[3],
+            normal[4],
+            alternate_values[3],
+            alternate_values[4],
+            clean_values[3],
+            clean_values[4],
+        )
+        return x + gate(
+            self.mlp(post),
+            normal[5],
+            alternate_values[5],
+            clean_values[5],
+        )
 
     def forward_varlen(
         self,
@@ -562,6 +617,8 @@ class SingleStreamBlock(nn.Module):
         max_seqlen: int,
         sample_ids: Tensor,
         clean_mask: Tensor,
+        alternate_vec: Tensor | None = None,
+        alternate_mask: Tensor | None = None,
     ) -> Tensor:
         """AdaLN-single block on a packed batch of independent sequences.
 
@@ -571,14 +628,30 @@ class SingleStreamBlock(nn.Module):
         """
         normal = self.mod(normal_vec)
         clean = self.mod(clean_vec)
+        alternate = self.mod(alternate_vec) if alternate_vec is not None else None
+        if alternate is not None and (
+            alternate_mask is None or alternate_mask.shape != clean_mask.shape
+        ):
+            raise ValueError("packed alternate mask must match the packed sequence")
 
-        def choose(normal_value: Tensor, clean_value: Tensor) -> Tensor:
+        def choose(
+            normal_value: Tensor,
+            clean_value: Tensor,
+            alternate_value: Tensor | None,
+        ) -> Tensor:
             normal_value = normal_value[:, 0, :][sample_ids]
             clean_value = clean_value[:, 0, :][sample_ids]
+            if alternate_value is not None:
+                alternate_value = alternate_value[:, 0, :][sample_ids]
+                normal_value = torch.where(
+                    alternate_mask[:, None], alternate_value, normal_value
+                )
             return torch.where(clean_mask[:, None], clean_value, normal_value)
 
+        alternate_values = alternate or (None,) * 6
         prescale, preshift, pregate, postscale, postshift, postgate = (
-            choose(n, c) for n, c in zip(normal, clean)
+            choose(n, c, a)
+            for n, c, a in zip(normal, clean, alternate_values)
         )
         pre = (1 + prescale) * self.prenorm(x) + preshift
         x = x + pregate * self.attn.forward_varlen(
@@ -669,13 +742,39 @@ class SingleStreamDiT(nn.Module):
         pos: Tensor,
         mask: Tensor | None = None,
         ref_token_count: int = 0,
-    ) -> Tensor:
+        alternate_t: Tensor | None = None,
+        alternate_target_mask: Tensor | None = None,
+        representation_layer: int | None = None,
+        return_velocity: bool = True,
+    ) -> Tensor | tuple[Tensor | None, Tensor]:
+        if representation_layer is not None and not (
+            1 <= representation_layer <= len(self.blocks)
+        ):
+            raise ValueError(
+                f"representation_layer must be in [1, {len(self.blocks)}]"
+            )
+        if not return_velocity and representation_layer is None:
+            raise ValueError("return_velocity=False requires representation_layer")
         img = self.first(img)
         flow_t = t
-        t = self.tmlp(
+        normal_t = self.tmlp(
             temb(flow_t, self.config.tdim, device=img.device, dtype=img.dtype)
         )
-        tvec = self.tproj(t)
+        normal_vec = self.tproj(normal_t)
+        alternate_t_embedding = None
+        alternate_vec = None
+        if alternate_t is not None:
+            if alternate_t.shape != flow_t.shape:
+                raise ValueError("alternate_t must have the same shape as t")
+            alternate_t_embedding = self.tmlp(
+                temb(
+                    alternate_t,
+                    self.config.tdim,
+                    device=img.device,
+                    dtype=img.dtype,
+                )
+            )
+            alternate_vec = self.tproj(alternate_t_embedding)
 
         _tm = mask[:, : context.shape[1]]
         txtmask = None if bool(_tm.all()) else _mask(_tm)
@@ -684,8 +783,37 @@ class SingleStreamDiT(nn.Module):
         context = self.txtmlp(context)
 
         txtlen, imglen = context.shape[1], img.shape[1]
+        targetlen = imglen - ref_token_count
+        if targetlen <= 0:
+            raise ValueError("the image stream must contain at least one target token")
         combined = torch.cat((context, img), dim=1)
+        combined_alternate_mask = None
+        if alternate_vec is not None:
+            if (
+                alternate_target_mask is None
+                or alternate_target_mask.shape != (img.shape[0], targetlen)
+            ):
+                raise ValueError(
+                    "alternate_target_mask must have shape (B, target_tokens)"
+                )
+            combined_alternate_mask = torch.cat(
+                (
+                    torch.zeros(
+                        (img.shape[0], txtlen),
+                        dtype=torch.bool,
+                        device=img.device,
+                    ),
+                    alternate_target_mask,
+                    torch.zeros(
+                        (img.shape[0], ref_token_count),
+                        dtype=torch.bool,
+                        device=img.device,
+                    ),
+                ),
+                dim=1,
+            )
         clean_token_range = None
+        clean_vec = None
         if ref_token_count:
             if not 0 < ref_token_count < imglen:
                 raise ValueError(
@@ -701,9 +829,7 @@ class SingleStreamDiT(nn.Module):
                     dtype=img.dtype,
                 )
             )
-            # Batch-concatenated vectors let every block select t=0 for the
-            # reference span without a per-token time-conditioning allocation.
-            tvec = torch.cat((tvec, self.tproj(clean_t)), dim=0)
+            clean_vec = self.tproj(clean_t)
             clean_token_range = (
                 txtlen + imglen - ref_token_count,
                 txtlen + imglen,
@@ -719,6 +845,10 @@ class SingleStreamDiT(nn.Module):
             combined = F.pad(combined, (0, 0, 0, _padlen))
             mask = F.pad(mask, (0, _padlen), value=False)
             pos = F.pad(pos, (0, 0, 0, _padlen))
+            if combined_alternate_mask is not None:
+                combined_alternate_mask = F.pad(
+                    combined_alternate_mask, (0, _padlen), value=False
+                )
 
         # A dense (B,1,L,L) attn_mask forces SDPA into an O(L^2)-memory kernel (SMs ~100%
         # busy but tensor cores idle / low power). When every token is valid (batch=1, no
@@ -728,6 +858,7 @@ class SingleStreamDiT(nn.Module):
 
         freqs = self.posemb(pos)
 
+        representation = None
         for i, block in enumerate(self.blocks):
             do_ckpt = (
                 self.gradient_checkpointing
@@ -738,20 +869,41 @@ class SingleStreamDiT(nn.Module):
                 combined = checkpoint(
                     block,
                     combined,
-                    tvec,
+                    normal_vec,
                     freqs,
                     mask,
+                    clean_vec,
                     clean_token_range,
+                    alternate_vec,
+                    combined_alternate_mask,
                     use_reentrant=False,
                 )
             else:
                 combined = block(
-                    combined, tvec, freqs, mask, clean_token_range
+                    combined,
+                    normal_vec,
+                    freqs,
+                    mask,
+                    clean_vec,
+                    clean_token_range,
+                    alternate_vec,
+                    combined_alternate_mask,
                 )
+            if representation_layer == i + 1:
+                representation = combined[:, txtlen : txtlen + targetlen]
+                if not return_velocity:
+                    return None, representation
 
-        final = self.last(combined, t)
-        output = final[:, txtlen : txtlen + imglen, :]
+        target_hidden = combined[:, txtlen : txtlen + targetlen]
+        output = self.last(
+            target_hidden,
+            normal_t,
+            alternate_t_embedding,
+            alternate_target_mask,
+        )
 
+        if representation_layer is not None:
+            return output, representation
         return output
 
     def forward_varlen(
@@ -761,7 +913,11 @@ class SingleStreamDiT(nn.Module):
         t: Tensor,
         image_positions: list[Tensor],
         ref_token_counts: list[int],
-    ) -> list[Tensor]:
+        alternate_t: Tensor | None = None,
+        alternate_target_masks: list[Tensor] | None = None,
+        representation_layer: int | None = None,
+        return_velocity: bool = True,
+    ) -> list[Tensor] | tuple[list[Tensor] | None, list[Tensor]]:
         """Run the DiT over a ragged batch with FlashAttention-2/4 varlen kernels.
 
         Each element describes exactly one independent sequence:
@@ -781,10 +937,29 @@ class SingleStreamDiT(nn.Module):
             raise ValueError(
                 f"varlen timestep must be (B,), got {tuple(t.shape)} for B={batch_size}"
             )
+        if representation_layer is not None and not (
+            1 <= representation_layer <= len(self.blocks)
+        ):
+            raise ValueError(
+                f"representation_layer must be in [1, {len(self.blocks)}]"
+            )
+        if not return_velocity and representation_layer is None:
+            raise ValueError("return_velocity=False requires representation_layer")
+        if alternate_t is not None:
+            if alternate_t.shape != t.shape:
+                raise ValueError("alternate_t must have the same shape as t")
+            if (
+                alternate_target_masks is None
+                or len(alternate_target_masks) != batch_size
+            ):
+                raise ValueError(
+                    "alternate_target_masks must contain one mask per sample"
+                )
 
         sequences: list[Tensor] = []
         positions: list[Tensor] = []
         clean_masks: list[Tensor] = []
+        alternate_masks: list[Tensor] = []
         target_masks: list[Tensor] = []
         sample_ids: list[Tensor] = []
         lengths: list[int] = []
@@ -820,6 +995,18 @@ class SingleStreamDiT(nn.Module):
                 torch.zeros(txt_len + target_len, dtype=torch.bool, device=img.device),
                 torch.ones(ref_len, dtype=torch.bool, device=img.device),
             )))
+            if alternate_t is not None:
+                alternate_target_mask = alternate_target_masks[sample]
+                if alternate_target_mask.shape != (target_len,):
+                    raise ValueError(
+                        f"sample {sample}: alternate target mask must have "
+                        f"shape ({target_len},)"
+                    )
+                alternate_masks.append(torch.cat((
+                    torch.zeros(txt_len, dtype=torch.bool, device=img.device),
+                    alternate_target_mask.to(device=img.device, dtype=torch.bool),
+                    torch.zeros(ref_len, dtype=torch.bool, device=img.device),
+                )))
             target_masks.append(torch.cat((
                 torch.zeros(txt_len, dtype=torch.bool, device=img.device),
                 torch.ones(target_len, dtype=torch.bool, device=img.device),
@@ -831,6 +1018,9 @@ class SingleStreamDiT(nn.Module):
         packed = torch.cat(sequences, dim=0)
         packed_pos = torch.cat(positions, dim=0)
         packed_clean_mask = torch.cat(clean_masks, dim=0)
+        packed_alternate_mask = (
+            torch.cat(alternate_masks, dim=0) if alternate_masks else None
+        )
         packed_target_mask = torch.cat(target_masks, dim=0)
         packed_sample_ids = torch.cat(sample_ids, dim=0)
         cumulative = [0]
@@ -843,12 +1033,25 @@ class SingleStreamDiT(nn.Module):
             temb(t, self.config.tdim, device=packed.device, dtype=packed.dtype)
         )
         normal_vec = self.tproj(normal_t)
+        alternate_t_embedding = None
+        alternate_vec = None
+        if alternate_t is not None:
+            alternate_t_embedding = self.tmlp(
+                temb(
+                    alternate_t,
+                    self.config.tdim,
+                    device=packed.device,
+                    dtype=packed.dtype,
+                )
+            )
+            alternate_vec = self.tproj(alternate_t_embedding)
         clean_t = self.tmlp(
             temb(torch.zeros_like(t), self.config.tdim, device=packed.device, dtype=packed.dtype)
         )
         clean_vec = self.tproj(clean_t)
         freqs = self.posemb(packed_pos.unsqueeze(0)).squeeze(0)
 
+        representation_tokens = None
         for i, block in enumerate(self.blocks):
             do_ckpt = (
                 self.gradient_checkpointing
@@ -859,17 +1062,47 @@ class SingleStreamDiT(nn.Module):
                 def block_forward(tokens, block=block):
                     return block.forward_varlen(
                         tokens, normal_vec, clean_vec, freqs, cu_seqlens, max_seqlen,
-                        packed_sample_ids, packed_clean_mask,
+                        packed_sample_ids, packed_clean_mask, alternate_vec,
+                        packed_alternate_mask,
                     )
                 packed = checkpoint(block_forward, packed, use_reentrant=False)
             else:
                 packed = block.forward_varlen(
                     packed, normal_vec, clean_vec, freqs, cu_seqlens, max_seqlen,
-                    packed_sample_ids, packed_clean_mask,
+                    packed_sample_ids, packed_clean_mask, alternate_vec,
+                    packed_alternate_mask,
                 )
+            if representation_layer == i + 1:
+                representation_tokens = packed[packed_target_mask]
+                if not return_velocity:
+                    target_sample_ids = packed_sample_ids[packed_target_mask]
+                    representations = [
+                        representation_tokens[target_sample_ids == sample]
+                        for sample in range(batch_size)
+                    ]
+                    return None, representations
 
-        target_tokens = self.last.forward_varlen(
-            packed[packed_target_mask], normal_t, packed_sample_ids[packed_target_mask]
-        )
         target_sample_ids = packed_sample_ids[packed_target_mask]
-        return [target_tokens[target_sample_ids == sample] for sample in range(batch_size)]
+        target_alternate_mask = (
+            packed_alternate_mask[packed_target_mask]
+            if packed_alternate_mask is not None
+            else None
+        )
+        target_tokens = self.last.forward_varlen(
+            packed[packed_target_mask],
+            normal_t,
+            target_sample_ids,
+            alternate_t_embedding,
+            target_alternate_mask,
+        )
+        outputs = [
+            target_tokens[target_sample_ids == sample]
+            for sample in range(batch_size)
+        ]
+        if representation_layer is not None:
+            representations = [
+                representation_tokens[target_sample_ids == sample]
+                for sample in range(batch_size)
+            ]
+            return outputs, representations
+        return outputs
